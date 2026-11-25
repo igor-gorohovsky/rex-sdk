@@ -1,0 +1,8 @@
+{
+  "name": "rex",
+  "version": "0.1.0",
+  "description": "rex-sdk as Claude Code tools: one MCP tool per SDK operation, for scripts in code mode.",
+  "author": {
+    "name": "Igor Gorohovsky"
+  }
+}

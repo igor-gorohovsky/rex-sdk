@@ -39,6 +39,7 @@
     "@effect/ai-openai": "4.1.0",
     "@effect/ai-typesafe": "4.1.0",
     "@effect/platform-node": "4.1.0",
+    "@modelcontextprotocol/sdk": "^1.32.2",
     "@types/node": "^26.6.5",
     "@types/ws": "^8.18.2",
     "ajv": "^8.20.0",

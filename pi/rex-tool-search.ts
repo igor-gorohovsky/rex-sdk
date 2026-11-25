@@ -92,12 +92,14 @@ function toSearchHit(operation: RexToolOperation): RexSearchHit {
 /**
  * Searches Rex tools. Query words that prefix a word of the tool's name score 2, words found only
  * in its description score 1, so a tool beats one whose description merely mentions it. Without a
- * query, a namespace lists its tools in table order; without either, returns the table of contents.
+ * query, a namespace lists its tools in table order; without either, returns the table of contents
+ * with `instructions`, which a host other than pi words its own way.
  */
 export function searchRexTools(
   operations: readonly RexToolOperation[],
   input: RexSearchInput = {},
   here: RexSearchHere = { sessionId: null, blockId: null },
+  instructions: string = rexToolInstructions,
 ): RexSearchResult {
   const queryWords = searchWordsOf(input.query ?? "");
   const namespace = input.namespace?.trim();
@@ -107,7 +109,7 @@ export function searchRexTools(
       counts.set(namespaceOf(operation), (counts.get(namespaceOf(operation)) ?? 0) + 1);
     }
     return {
-      instructions: rexToolInstructions,
+      instructions,
       here,
       namespaces: [...counts].map(([name, tools]) => ({ name, tools })),
     };
@@ -215,13 +217,17 @@ function readSearchInput(params: unknown): RexSearchInput {
   };
 }
 
-/** Runs one `rex_search` call: the result as text and as `structuredContent`. */
+/**
+ * Runs one `rex_search` call: the result as text and as `structuredContent`. `instructions` is
+ * what an empty search returns, for a host other than pi.
+ */
 export function runRexSearch(
   operations: readonly RexToolOperation[],
   params: unknown,
   here: RexSearchHere,
+  instructions: string = rexToolInstructions,
 ): AgentToolResult<undefined> {
-  const result = searchRexTools(operations, readSearchInput(params), here);
+  const result = searchRexTools(operations, readSearchInput(params), here, instructions);
   const text = JSON.stringify(result);
   return {
     content: [{ type: "text", text }],
