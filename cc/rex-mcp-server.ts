@@ -1,6 +1,8 @@
 /**
- * The Rex tools as an MCP server for Claude Code: `rex_search` and one tool per SDK operation, the
- * same table, parameters, and error messages as the pi extension in `../pi`.
+ * The Rex tools as an MCP server for Claude Code: `search` and one tool per SDK operation, the
+ * same table, parameters, and error messages as the pi extension in `../pi`. Tools are named
+ * without pi's `rex_` prefix (`terminals_writeLine`, not `rex_terminals_writeLine`): Claude Code
+ * already puts the server's name before each one (`mcp__rex__terminals_writeLine`).
  *
  * Results are JSON text only. Claude Code's code mode parses a JSON text result into an object, but
  * hands a script a string once a result carries `structuredContent` (measured on v2.1.332), and MCP
@@ -33,7 +35,6 @@ import {
 } from "../pi/rex-tool-schemas.ts";
 import {
   readSearchInput,
-  REX_SEARCH_TOOL_NAME,
   rexToolInstructions,
   searchRexTools,
   toRexSearchToolDefinition,
@@ -57,11 +58,14 @@ export function makeRexMcpRuntime(): RexToolRuntime {
   );
 }
 
+/** The name of the tool that finds the others. */
+const SEARCH_TOOL_NAME = "search";
+
 /** The pi texts that name pi or pi's way of calling a tool, as Claude Code words them. */
 const CLAUDE_CODE_WORDING: ReadonlyArray<readonly [pi: string, claudeCode: string]> = [
   [
     "Find tools: rex_search({ query, namespace?, limit? }) → describeTool(name) for the signature → tools.<name>(args).",
-    'Find tools: searchTools("rex <words>") → describeTool(name) for the parameters → tools[name](args), with the full name searchTools returns. Claude Code puts the MCP server\'s prefix before each tool name, and the prefix depends on how this server is installed, so never write a name by hand: rex_terminals_writeLine is the tool whose name ends in "__rex_terminals_writeLine". rex_search({ query }) ranks the same tools by their short names. describeTool shows a tool\'s parameters, and its description ends with what it returns (Returns: a TypeScript type).',
+    'Find tools: searchTools("rex <words>") → describeTool(name) for the parameters → tools[name](args), with the full name searchTools returns. Claude Code puts the MCP server\'s prefix before each tool name, and the prefix depends on how this server is installed, so never write a name by hand: terminals_writeLine is the tool whose name ends in "rex__terminals_writeLine", rex__ included, since another server may have a tool with the same short name, such as search. search({ query }) ranks the same tools by their short names. describeTool shows a tool\'s parameters, and its description ends with what it returns (Returns: a TypeScript type).',
   ],
   [
     "the session and terminal block pi runs in",
@@ -71,21 +75,28 @@ const CLAUDE_CODE_WORDING: ReadonlyArray<readonly [pi: string, claudeCode: strin
   ["in this pi session", "in this Claude Code session"],
 ];
 
-/** A pi text worded for Claude Code. The tests fail if pi rewords a text this relies on. */
-function convertTextForClaudeCode(text: string): string {
+/**
+ * pi's `rex_` before one of `toolNames` (`rex_terminals_writeLine`) or a placeholder
+ * (`rex_<sdkNamespace>`). Other text keeps its `rex_`, such as a path an error message quotes.
+ */
+function makePiToolPrefixPattern(toolNames: readonly string[]): RegExp {
+  return new RegExp(`\\brex_(?=<|(?:${toolNames.join("|")})\\b)`, "g");
+}
+
+/**
+ * A pi text worded for Claude Code, with this server's tool names. The tests fail if pi rewords a
+ * text this relies on.
+ */
+function convertTextForClaudeCode(text: string, piToolPrefix: RegExp): string {
   // A replacer function inserts the text as is; a replacement string would expand `$&` and such.
   return CLAUDE_CODE_WORDING.reduce(
     (result, [pi, claudeCode]) => result.replace(pi, () => claudeCode),
     text,
-  );
+  ).replace(piToolPrefix, "");
 }
 
 function parseInputSchema(schema: unknown): Tool["inputSchema"] {
   return ToolSchema.shape.inputSchema.parse(schema);
-}
-
-function nameOperationTool(operation: RexToolOperation): string {
-  return `rex_${operation.name}`;
 }
 
 function describeOperationTool(operation: RexToolOperation): Tool {
@@ -94,7 +105,7 @@ function describeOperationTool(operation: RexToolOperation): Tool {
       ? rexToolVoidOutputJsonSchema
       : rexToolOutputJsonSchema(operation.output);
   return {
-    name: nameOperationTool(operation),
+    name: operation.name,
     description: `${operation.description}\n\nReturns: ${describeResultType(result)}`,
     inputSchema: parseInputSchema(
       rexToolParametersJsonSchema({ fields: operation.fields, input: operation.input }),
@@ -124,7 +135,7 @@ function describeArgumentErrors(errors: readonly ErrorObject[]): string {
     .join("; ");
 }
 
-/** A tool this server answers: its argument validator, and its operation (none for rex_search). */
+/** A tool this server answers: its argument validator, and its operation (none for search). */
 interface RexMcpTool {
   readonly validate: ValidateFunction;
   readonly operation: RexToolOperation | undefined;
@@ -135,7 +146,7 @@ interface RexMcpClient {
   readonly here: RexSearchHere;
   /**
    * `here` with its session looked up: the lookup running now, or the one that found the session.
-   * A lookup that failed or found nothing is dropped, so the next empty `rex_search` asks again.
+   * A lookup that failed or found nothing is dropped, so the next empty `search` asks again.
    */
   completeHere: Promise<RexSearchHere> | undefined;
   readonly marks: RexMarkStore;
@@ -175,40 +186,50 @@ function findSessionOfBlock(blockId: string) {
  */
 export class RexMcpServer {
   readonly #runtime: RexToolRuntime;
+  readonly #piToolPrefix: RegExp;
   readonly #operations: readonly RexToolOperation[];
-  readonly #instructions = convertTextForClaudeCode(rexToolInstructions);
+  readonly #instructions: string;
   readonly #tools: readonly Tool[];
   readonly #toolsByName: ReadonlyMap<string, RexMcpTool>;
 
   constructor(runtime: RexToolRuntime, operations: readonly RexToolOperation[]) {
     this.#runtime = runtime;
-    this.#operations = operations;
+    this.#piToolPrefix = makePiToolPrefixPattern([
+      SEARCH_TOOL_NAME,
+      ...operations.map((operation) => operation.name),
+    ]);
+    this.#instructions = convertTextForClaudeCode(rexToolInstructions, this.#piToolPrefix);
+    // Worded once, so tools/list and search hits name the tools the same way.
+    this.#operations = operations.map((operation) => ({
+      ...operation,
+      description: convertTextForClaudeCode(operation.description, this.#piToolPrefix),
+    }));
     // Only the definition's name, description, and parameters are used: each client's own here
     // goes to searchRexTools.
     const search = toRexSearchToolDefinition(operations, { sessionId: null, blockId: null });
     this.#tools = [
       {
-        name: search.name,
-        description: convertTextForClaudeCode(search.description),
+        name: SEARCH_TOOL_NAME,
+        description: convertTextForClaudeCode(search.description, this.#piToolPrefix),
         inputSchema: parseInputSchema(search.parameters),
         annotations: search.annotations,
       },
-      ...operations.map(describeOperationTool),
+      ...this.#operations.map(describeOperationTool),
     ];
     // pi validates arguments against the schema before a tool runs; MCP hands them over as sent.
     const ajv = new Ajv2020({ strict: false, allErrors: true });
-    const operationsByTool = new Map(
-      operations.map((operation) => [nameOperationTool(operation), operation]),
+    const operationsByName = new Map(
+      this.#operations.map((operation) => [operation.name, operation]),
     );
     this.#toolsByName = new Map(
       this.#tools.map((tool) => [
         tool.name,
-        { validate: ajv.compile(tool.inputSchema), operation: operationsByTool.get(tool.name) },
+        { validate: ajv.compile(tool.inputSchema), operation: operationsByName.get(tool.name) },
       ]),
     );
   }
 
-  /** `rex_search` and one tool per operation, as `tools/list` returns them. */
+  /** `search` and one tool per operation, as `tools/list` returns them. */
   listTools(): Tool[] {
     return [...this.#tools];
   }
@@ -248,7 +269,7 @@ export class RexMcpServer {
   ): Promise<CallToolResult> {
     const tool = this.#toolsByName.get(name);
     if (tool === undefined) {
-      return convertToErrorResult(`Unknown tool ${name}; find tools with ${REX_SEARCH_TOOL_NAME}.`);
+      return convertToErrorResult(`Unknown tool ${name}; find tools with ${SEARCH_TOOL_NAME}.`);
     }
     if (!tool.validate(params)) {
       return convertToErrorResult(
@@ -265,7 +286,15 @@ export class RexMcpServer {
       );
       // Only an empty search shows where the client runs; a search for tools never asks Rex.
       return convertToTextResult(
-        "here" in found ? { ...found, here: await this.#completeHere(client) } : found,
+        "here" in found
+          ? { ...found, here: await this.#completeHere(client) }
+          : {
+              ...found,
+              tools: found.tools.map((hit) => ({
+                ...hit,
+                name: hit.name.replace(this.#piToolPrefix, ""),
+              })),
+            },
       );
     }
     const exit = await this.#runtime.run(
@@ -279,7 +308,13 @@ export class RexMcpServer {
       if (error instanceof RexToolError && error.tag === "RexConfigurationError") {
         await this.#runtime.dispose();
       }
-      return convertToErrorResult(error instanceof Error ? error.message : String(error));
+      // pi's messages name its tools, such as RexUnknownMark's "make a new one with rex_terminals_mark".
+      return convertToErrorResult(
+        convertTextForClaudeCode(
+          error instanceof Error ? error.message : String(error),
+          this.#piToolPrefix,
+        ),
+      );
     }
   }
 

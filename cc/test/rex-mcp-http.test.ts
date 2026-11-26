@@ -141,7 +141,7 @@ describe("rex MCP over HTTP", () => {
     // Claude Code expands an unset ${REX_BLOCK:-} to an empty header.
     const outside = await connectClient({ "X-Rex-Block": "" });
     const readHere = async (client: Client) =>
-      decodeHere(decodeJsonText((await callTool(client, "rex_search", {})).content[0].text)).here;
+      decodeHere(decodeJsonText((await callTool(client, "search", {})).content[0].text)).here;
     expect(await readHere(full)).toEqual({ sessionId, blockId });
     expect(await readHere(blockOnly)).toEqual({ sessionId, blockId: lookedUpBlockId });
     expect(await readHere(outside)).toEqual({ sessionId: null, blockId: null });
@@ -151,7 +151,7 @@ describe("rex MCP over HTTP", () => {
   test("a search for tools does not ask Rex where a client runs", async () => {
     const blockOnly = await connectClient({ "X-Rex-Block": lookedUpBlockId });
     const sent = server.requests().length;
-    const found = await callTool(blockOnly, "rex_search", { query: "terminal" });
+    const found = await callTool(blockOnly, "search", { query: "terminal" });
     expect(found.isError).toBeUndefined();
     expect(server.requests().length).toBe(sent);
   });
@@ -159,7 +159,7 @@ describe("rex MCP over HTTP", () => {
   test("a mark belongs to the client that made it", async () => {
     const maker = await connectClient({});
     const other = await connectClient({});
-    const marked = await callTool(maker, "rex_terminals_mark", { sessionId, blockId });
+    const marked = await callTool(maker, "terminals_mark", { sessionId, blockId });
     const { markId } = Schema.decodeUnknownSync(
       Schema.fromJsonString(Schema.Struct({ markId: Schema.String })),
     )(marked.content[0].text);
@@ -170,12 +170,15 @@ describe("rex MCP over HTTP", () => {
       match: { type: "substring", value: "never printed" },
       timeoutMs: 50,
     };
-    const own = await callTool(maker, "rex_terminals_waitForOutput", wait);
+    const own = await callTool(maker, "terminals_waitForOutput", wait);
     expect(own.isError).toBeUndefined();
     expect(decodeJsonText(own.content[0].text)).toMatchObject({ timedOut: true });
-    const foreign = await callTool(other, "rex_terminals_waitForOutput", wait);
+    const foreign = await callTool(other, "terminals_waitForOutput", wait);
     expect(foreign.isError).toBe(true);
     expect(foreign.content[0].text).toMatch(/^RexUnknownMark: mark \S+ is unknown/);
+    // pi's message names its own tools; this server words it with its own names.
+    expect(foreign.content[0].text).toContain("terminals_mark");
+    expect(foreign.content[0].text).not.toMatch(/\brex_/);
   });
 
   test("closing one client ends its session and leaves the others served", async () => {
@@ -185,7 +188,7 @@ describe("rex MCP over HTTP", () => {
     const before = service.countSessions();
     await leaving.terminateSession();
     expect(service.countSessions()).toBe(before - 1);
-    const listed = await callTool(staying, "rex_sessions_list", {});
+    const listed = await callTool(staying, "sessions_list", {});
     expect(listed.isError).toBeUndefined();
   });
 
@@ -218,7 +221,7 @@ describe("rex MCP over HTTP", () => {
       expect(quick.countSessions()).toBe(1);
       const waited = decodeToolResult(
         await client.callTool({
-          name: "rex_terminals_waitForOutput",
+          name: "terminals_waitForOutput",
           arguments: {
             sessionId,
             blockId,
