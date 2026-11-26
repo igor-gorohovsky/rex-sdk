@@ -1,9 +1,28 @@
 # rex MCP server
 
 Serves this SDK to agents as an MCP server: one tool per SDK operation, plus `here`, for Claude
-Code, pi, and any other MCP client. The tool table is [`rex-tools.ts`](rex-tools.ts) and the usage
-text the clients show their model is [`instructions.md`](instructions.md); nothing else describes
-the tools.
+Code, pi, and any other MCP client. The tool table is [`rex-tools.ts`](rex-tools.ts). The usage
+docs are one skill, [`skills/rex-tools/SKILL.md`](skills/rex-tools/SKILL.md); nothing else
+describes the tools.
+
+## The docs
+
+The server serves the skill through the MCP skills extension (`io.modelcontextprotocol/skills`:
+`skills/list`, `skills/get`, `resources/directory/read`) at `skill://rex-tools/SKILL.md`, which
+is also an ordinary resource. The server instructions are a pointer to that URI followed by the
+SKILL.md body, built at start, so every client has the docs even when it does not load MCP skills:
+
+| Client                                                             | How the docs reach the model                                                                              |
+| ------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------- |
+| Claude Code, MCP skills blocked (Team plan default) or `claude -p` | The server instructions; the skill as a resource (ReadMcpResourceTool)                                    |
+| Claude Code, MCP skills allowed                                    | The instructions, and `rex-tools` as a skill                                                              |
+| pi (no MCP skills)                                                 | The first line in the system prompt; the rest with `describeNamespace("mcp__rex")` or `read_mcp_resource` |
+| Claude Code with this folder as a plugin (`--plugin-dir`)          | Also `rex:rex-tools` as a plugin skill: Claude Code loads a plugin's `skills/` folder itself              |
+
+Claude Code (2.1.332) cuts server instructions after 4096 characters, so the SKILL.md body must
+fit (a test checks it); longer guidance belongs in files under `skills/rex-tools/references/`.
+The skill is not named `rex`, the name of Rex's own skill for its CLI. The server reads the skill
+once, at start, and serves that text until it restarts, however the checkout changes.
 
 ## Run it
 
@@ -60,8 +79,7 @@ const call = async (op, args) => {
 const { sessionId, blockId } = await call("here", {});
 ```
 
-[`instructions.md`](instructions.md) covers names, parameters, results, failures, and waits. What
-it leaves to the code:
+The skill covers names, parameters, results, failures, and waits. What it leaves to the code:
 
 - **Results** carry no `structuredContent`, and each description ends with the result's
   TypeScript type instead: Claude Code (2.1.332) hands a script a string instead of the parsed
@@ -84,7 +102,7 @@ it leaves to the code:
 | File                  | Owns                                                            |
 | --------------------- | --------------------------------------------------------------- |
 | `rex-tools.ts`        | The tool table and the SDK operations left out                  |
-| `instructions.md`     | The usage text sent as the server instructions                  |
+| `skills/rex-tools/`   | The usage docs: the skill, and the server instructions          |
 | `rex-tool-schemas.ts` | Effect Schema → JSON Schema for parameters and results          |
 | `rex-result-types.ts` | A result's JSON Schema → the TypeScript type in its description |
 | `rex-tool-runtime.ts` | The lazily built SDK runtime, exits → MCP tool results          |

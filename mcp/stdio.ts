@@ -5,6 +5,7 @@
  */
 import { serveStdio, StdioServerTransport } from "@modelcontextprotocol/server/stdio";
 import {
+  loadRexMcpDocs,
   makeRexMcpRuntime,
   parseCallerBlockId,
   REX_MCP_MAX_MESSAGE_BYTES,
@@ -14,15 +15,15 @@ import { rexTools } from "./rex-tools.ts";
 
 const callerBlockId = parseCallerBlockId(process.env.REX_BLOCK);
 const runtime = makeRexMcpRuntime();
-const mcp = new RexMcpServer(runtime, rexTools);
+const mcp = new RexMcpServer(runtime, rexTools, await loadRexMcpDocs());
 serveStdio(
   () => {
-    const server = mcp.createServer(callerBlockId);
+    const instance = mcp.createServer(callerBlockId);
     // However the connection ends (stdin closed, or a message the transport could not read),
     // dispose the Rex connection so the process exits instead of outliving its client. The
     // runtime is rebuilt if a later instance still calls a tool.
-    server.onclose = () => void runtime.dispose();
-    return server;
+    instance.server.onclose = () => void runtime.dispose();
+    return instance;
   },
   {
     // The same limit as over HTTP; past it the transport closes the connection.

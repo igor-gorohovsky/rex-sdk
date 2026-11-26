@@ -2,16 +2,26 @@
  * Serves the Rex tools over streamable HTTP to MCP clients of both protocol eras at once, as the
  * shared service serves Claude Code (2026-07-28) and pi (2025-11-25), against the SDK's test server.
  */
-import { readFileSync } from "node:fs";
+import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { request } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
+import { InMemoryTransport } from "@modelcontextprotocol/server";
+import { SkillsClient } from "@modelcontextprotocol/client/ext/skills";
 import { Effect, Exit, Option, Schema, Scope } from "effect";
 import { afterAll, beforeAll, describe, expect, test } from "vite-plus/test";
 import { BlockId, SessionId, rexSdkLayerFromOptions } from "../../src/index.ts";
 import { startRexTestServer, type IRexTestServer } from "../../src/testing/rex-test-server.ts";
 import { startRexTestTerminal } from "../../src/testing/rex-test-terminal.ts";
 import { findTcpPeerUid, startRexMcpHttpServer, type RexMcpHttpServer } from "../rex-mcp-http.ts";
-import { RexMcpServer } from "../rex-mcp-server.ts";
+import {
+  loadRexMcpDocs,
+  makeRexMcpRuntime,
+  REX_SKILL_URI,
+  RexMcpServer,
+} from "../rex-mcp-server.ts";
 import { RexToolRuntime } from "../rex-tool-runtime.ts";
 import { rexTools } from "../rex-tools.ts";
 
@@ -27,7 +37,10 @@ const ToolResult = Schema.Struct({
   structuredContent: Schema.optionalKey(Schema.Unknown),
 });
 const decodeToolResult = Schema.decodeUnknownSync(ToolResult);
-const instructions = readFileSync(new URL("../instructions.md", import.meta.url), "utf8");
+const skillMarkdown = readFileSync(
+  new URL("../skills/rex-tools/SKILL.md", import.meta.url),
+  "utf8",
+);
 
 /** Sends one raw HTTP request, so a test can set headers fetch refuses, such as Host. */
 function sendRaw(url: string, headers: Record<string, string>, body: string) {
@@ -116,7 +129,7 @@ describe("rex MCP over HTTP", () => {
       }),
     );
     service = await startRexMcpHttpServer({
-      mcp: new RexMcpServer(runtime, rexTools, { progressIntervalMs: 100 }),
+      mcp: new RexMcpServer(runtime, rexTools, await loadRexMcpDocs(), { progressIntervalMs: 100 }),
       port: 0,
       log: () => undefined,
     });
@@ -131,15 +144,45 @@ describe("rex MCP over HTTP", () => {
 
   for (const { era, versionNegotiation } of eras) {
     describe(era, () => {
-      test("the instructions are instructions.md, naming tools without a client's prefix", async () => {
+      test("the instructions point to the skill, then carry its SKILL.md body whole", async () => {
         const client = await connectClient({}, versionNegotiation);
-        expect(client.getInstructions()).toBe(instructions);
+        const instructions = client.getInstructions() ?? "";
+        expect(instructions.split("\n")[0]).toContain(REX_SKILL_URI);
+        // The whole body after the frontmatter, as SKILL.md has it.
+        const body = skillMarkdown.slice(skillMarkdown.indexOf("\n# Rex tools\n") + 1);
+        expect(body.startsWith("# Rex tools\n")).toBe(true);
+        expect(instructions.endsWith(`\n\n${body}`)).toBe(true);
+        expect(instructions).not.toContain("name: rex-tools");
+        // Claude Code (2.1.332) cuts instructions after 4096 characters, which would drop the end of
+        // the docs: past that, move guidance into files under the skill's references/.
+        expect(instructions.length).toBeLessThanOrEqual(4096);
         expect(instructions).not.toMatch(/\brex_(?!_)/);
-        expect(instructions).not.toContain("rex_search");
+      });
+
+      test("serves the rex-tools skill through the skills extension and as a plain resource", async () => {
+        const client = await connectClient({}, versionNegotiation);
+        const skills = new SkillsClient(client);
+        expect(skills.supported).toBe(true);
+        const { skills: listed } = await skills.list();
+        expect(listed.map((skill) => [skill.uri, skill.frontmatter.name])).toEqual([
+          [REX_SKILL_URI, "rex-tools"],
+        ]);
+        const { skill } = await skills.get(REX_SKILL_URI);
+        // read checks the file against the digest and size in the entry.
+        const file = await skills.read(skill);
+        expect(file.verified).toBe(true);
+        expect(new TextDecoder().decode(file.bytes)).toBe(skillMarkdown);
+        // A client without the extension, such as pi, lists and reads it as an ordinary resource.
+        const { resources } = await client.listResources();
+        expect(resources.map((resource) => resource.uri)).toEqual([REX_SKILL_URI]);
+        const read = await client.readResource({ uri: REX_SKILL_URI });
+        expect(read.contents[0]).toMatchObject({ mimeType: "text/markdown", text: skillMarkdown });
       });
 
       test("lists every tool with an object input schema, no output schema, and its result type", async () => {
         const client = await connectClient({}, versionNegotiation);
+        // The tool list never changes, so the server does not offer list_changed notifications.
+        expect(client.getServerCapabilities()?.tools).toEqual({});
         const { tools } = await client.listTools();
         expect(tools.map((tool) => tool.name)).toEqual(rexTools.map((tool) => tool.name));
         for (const tool of tools) {
@@ -282,4 +325,35 @@ describe("the peer check", () => {
   test("finds nothing for a connection the table does not hold", () => {
     expect(Option.isNone(findTcpPeerUid(table, 41_001, 7317))).toBe(true);
   });
+});
+
+test("the skill keeps the text the server started with after SKILL.md changes on disk", async () => {
+  // A copy of the skills, so the test can change one, as an edit or a pull changes the checkout
+  // a long-running service serves from.
+  const root = mkdtempSync(join(tmpdir(), "rex-mcp-skills-"));
+  // Built only by a tool call, which this test does not make.
+  const runtime = makeRexMcpRuntime();
+  try {
+    cpSync(fileURLToPath(new URL("../skills", import.meta.url)), root, { recursive: true });
+    const docs = await loadRexMcpDocs(root);
+    writeFileSync(join(root, "rex-tools", "SKILL.md"), `${skillMarkdown}\nChanged.\n`);
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    const instance = new RexMcpServer(runtime, rexTools, docs).createServer(null);
+    await instance.connect(serverTransport);
+    const client = new Client(
+      { name: "rex-mcp-skill-test", version: "0.0.0" },
+      { versionNegotiation: { mode: "legacy" } },
+    );
+    await client.connect(clientTransport);
+    try {
+      const read = await client.readResource({ uri: REX_SKILL_URI });
+      expect(read.contents[0]).toMatchObject({ text: skillMarkdown });
+      expect(client.getInstructions()?.endsWith(skillMarkdown.slice(-200))).toBe(true);
+    } finally {
+      await client.close();
+    }
+  } finally {
+    await runtime.dispose();
+    rmSync(root, { recursive: true, force: true });
+  }
 });

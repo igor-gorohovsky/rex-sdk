@@ -1,6 +1,7 @@
 /**
  * The Rex tools as an MCP server, for every MCP client (Claude Code, pi, …): one tool per row of
- * the tool table in rex-tools.ts, and the usage text in instructions.md as the server instructions.
+ * the tool table in rex-tools.ts, and the usage docs as one skill, skills/rex-tools/SKILL.md, served
+ * as an MCP skill and as the server instructions (README.md, "The docs").
  *
  * Results are JSON text only. Claude Code's code mode hands a script the parsed value of JSON text,
  * but a string once a result carries `structuredContent` (v2.1.332), and MCP allows an
@@ -10,8 +11,19 @@
  * A server instance holds no state of its own: the transport builds one per HTTP request or stdio
  * connection with the client's block (`callerBlockId`), and the marks live in the process-wide store.
  */
-import { readFileSync } from "node:fs";
-import { isSpecType, Server, type CallToolResult, type Tool } from "@modelcontextprotocol/server";
+import { fileURLToPath } from "node:url";
+import {
+  isSpecType,
+  McpServer,
+  type CallToolResult,
+  type Tool,
+} from "@modelcontextprotocol/server";
+import {
+  SkillsExtension,
+  type SkillCatalog,
+  type SkillFiles,
+} from "@modelcontextprotocol/server/ext/skills";
+import { nodeSkillFiles } from "@modelcontextprotocol/server/ext/skills/node";
 import { Layer, Logger, Schema } from "effect";
 import { BlockId, rexSdkLayerFromOptions } from "../src/index.ts";
 import plugin from "./.claude-plugin/plugin.json" with { type: "json" };
@@ -27,8 +39,63 @@ import type { RexTool } from "./rex-tools.ts";
 /** The version in `.claude-plugin/plugin.json`, sent as the MCP server and Rex client version. */
 const REX_MCP_SERVER_VERSION = plugin.version;
 
-/** How to use the tools, sent as the server instructions: Claude Code and pi show it to the model. */
-const rexMcpInstructions = readFileSync(new URL("./instructions.md", import.meta.url), "utf8");
+/** The folder of skill folders the server serves. */
+const REX_SKILLS_ROOT = fileURLToPath(new URL("./skills", import.meta.url));
+
+/**
+ * The skill that holds the usage docs. Not `rex`: that is Rex's own skill for its CLI
+ * (`rex skill show`, ~/.agents/skills/rex).
+ */
+const REX_SKILL_NAME = "rex-tools";
+
+/** Where a client finds the usage docs, as a skill or a plain resource. */
+export const REX_SKILL_URI = `skill://${REX_SKILL_NAME}/SKILL.md`;
+
+/** The usage docs, served two ways from one SKILL.md. */
+export interface RexMcpDocs {
+  /** The skills extension's catalog: `skills/list`, `skills/get`, and `skill://` resources. */
+  readonly skills: SkillCatalog;
+  /** The server instructions. */
+  readonly instructions: string;
+}
+
+/**
+ * The server instructions: a pointer to the skill, then the SKILL.md body. The pointer comes first
+ * because pi puts only the first line in its system prompt.
+ */
+function buildRexMcpInstructions(skillMarkdown: string): string {
+  const body = skillMarkdown.replace(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n)+/, "");
+  return `Rex tools for sessions, tabs, panes, terminals. The rest of these instructions is the rex-tools skill (${REX_SKILL_URI}): read it before the first call (pi: describeNamespace("mcp__rex")).\n\n${body}`;
+}
+
+/**
+ * `files`, answering every read of a path with the bytes of its first read. The catalog reads each
+ * file as it loads and checks every later read against the digest it took then, so without this a
+ * skill file changed on disk (an edit, a pull) fails each read until a restart.
+ */
+function cacheSkillFileReads(files: SkillFiles): SkillFiles {
+  const reads = new Map<string, Promise<Uint8Array>>();
+  return {
+    list: (dir) => files.list(dir),
+    read: (path) => {
+      const read = reads.get(path) ?? files.read(path);
+      reads.set(path, read);
+      return read;
+    },
+  };
+}
+
+/**
+ * Loads the skills under `skillsRoot` once: the skill and the instructions keep the text they
+ * started with until a restart. A SKILL.md the extension would warn about fails the start instead.
+ */
+export async function loadRexMcpDocs(skillsRoot: string = REX_SKILLS_ROOT): Promise<RexMcpDocs> {
+  const files = cacheSkillFileReads(nodeSkillFiles(skillsRoot));
+  const skills = await SkillsExtension.load(files, { strict: true });
+  // From the cache the catalog filled, so the instructions are the text the skill serves.
+  const skillMarkdown = new TextDecoder().decode(await files.read(`${REX_SKILL_NAME}/SKILL.md`));
+  return { skills, instructions: buildRexMcpInstructions(skillMarkdown) };
+}
 
 /**
  * How often a call still running sends its client a progress notification, when the client asked
@@ -91,13 +158,16 @@ export class RexMcpServer {
   readonly #tools: ReadonlyMap<string, RexMcpTool>;
   readonly #listed: readonly Tool[];
   readonly #progressIntervalMs: number;
+  readonly #docs: RexMcpDocs;
 
   constructor(
     runtime: RexToolRuntime,
     tools: readonly RexTool[],
+    docs: RexMcpDocs,
     options: { readonly progressIntervalMs?: number } = {},
   ) {
     this.#runtime = runtime;
+    this.#docs = docs;
     this.#progressIntervalMs = options.progressIntervalMs ?? PROGRESS_INTERVAL_MS;
     const entries = tools.map((tool) => ({ tool, listed: convertToListedTool(tool) }));
     this.#listed = entries.map(({ listed }) => listed);
@@ -115,13 +185,19 @@ export class RexMcpServer {
   }
 
   /** An MCP server instance for one request or connection of a client in `callerBlockId`. */
-  createServer(callerBlockId: BlockId | null): Server {
-    const server = new Server(
+  createServer(callerBlockId: BlockId | null): McpServer {
+    // McpServer because the skills extension attaches only to one; the tools are answered from the
+    // precomputed table on its low-level server, not registered one by one. The tools capability
+    // goes there too: McpServer's `tools` option would install its own tool handlers and advertise
+    // `listChanged`, which this server never sends.
+    const mcpServer = new McpServer(
       { name: "rex", version: REX_MCP_SERVER_VERSION },
-      { capabilities: { tools: {} }, instructions: rexMcpInstructions },
+      { instructions: this.#docs.instructions },
     );
-    server.setRequestHandler("tools/list", async () => ({ tools: this.listTools() }));
-    server.setRequestHandler("tools/call", async (request, context) => {
+    mcpServer.server.registerCapabilities({ tools: {} });
+    this.#docs.skills.attach(mcpServer);
+    mcpServer.server.setRequestHandler("tools/list", async () => ({ tools: this.listTools() }));
+    mcpServer.server.setRequestHandler("tools/call", async (request, context) => {
       const progressToken = context.mcpReq._meta?.progressToken;
       let progress = 0;
       const timer =
@@ -145,7 +221,7 @@ export class RexMcpServer {
         clearInterval(timer);
       }
     });
-    return server;
+    return mcpServer;
   }
 
   /**

@@ -24,7 +24,7 @@ import {
   type IRexTestServer,
   type RexTestServerBytesPeer,
 } from "../../src/testing/rex-test-server.ts";
-import { RexMcpServer } from "../rex-mcp-server.ts";
+import { loadRexMcpDocs, RexMcpServer } from "../rex-mcp-server.ts";
 import { RexToolRuntime } from "../rex-tool-runtime.ts";
 import { deriveRexToolOutputJsonSchema, encodeRexToolResult } from "../rex-tool-schemas.ts";
 import { rexToolExclusions, rexTools } from "../rex-tools.ts";
@@ -266,7 +266,7 @@ describe("rex tools", () => {
     server = await Effect.runPromise(startRexTestServer().pipe(Scope.provide(scope)));
     handleEverything(server);
     runtime = makeRuntime(server.socketPath);
-    mcp = new RexMcpServer(runtime, rexTools);
+    mcp = new RexMcpServer(runtime, rexTools, await loadRexMcpDocs());
   });
 
   afterAll(async () => {
@@ -548,7 +548,7 @@ test("a missing server fails with the SDK's connection error", async () => {
     ),
   );
   try {
-    const mcp = new RexMcpServer(runtime, rexTools);
+    const mcp = new RexMcpServer(runtime, rexTools, await loadRexMcpDocs());
     const result = await mcp.callTool("server_status", {}, blockId, undefined);
     const error = await awaitToolError(Promise.resolve().then(() => readResult(result)));
     expect(error.tag).toMatch(/^RexConnection/);
