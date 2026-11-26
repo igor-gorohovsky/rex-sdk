@@ -28,7 +28,7 @@ export default defineConfig({
     options: { typeAware: true, typeCheck: true },
   },
   test: {
-    include: ["src/**/*.test.ts", "scripts/**/*.test.ts", "pi/**/*.test.ts", "cc/**/*.test.ts"],
+    include: ["src/**/*.test.ts", "scripts/**/*.test.ts", "mcp/**/*.test.ts"],
     testTimeout: 15_000,
   },
 });

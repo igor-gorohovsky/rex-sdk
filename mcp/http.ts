@@ -1,15 +1,15 @@
 /**
- * Serves the Rex tools to every Claude Code session on this machine from one process, over MCP
- * streamable HTTP on 127.0.0.1 (see rex-mcp-http.ts). Run it as a service:
+ * Serves the Rex tools to every agent on this machine (Claude Code and pi sessions) from one
+ * process, over MCP streamable HTTP on 127.0.0.1 (see rex-mcp-http.ts). Run it as a service:
  *
- *   node cc/http.ts [--port 7317]
+ *   node mcp/http.ts [--port 7317]
  *
- * SIGTERM or SIGINT ends the MCP sessions and closes the Rex connection before the process exits.
+ * SIGTERM or SIGINT stops serving and closes the Rex connection before the process exits.
  */
 import { parseArgs } from "node:util";
-import { rexToolOperations } from "../pi/rex-tool-operations.ts";
 import { REX_MCP_HTTP_DEFAULT_PORT, startRexMcpHttpServer } from "./rex-mcp-http.ts";
 import { makeRexMcpRuntime, RexMcpServer } from "./rex-mcp-server.ts";
+import { rexTools } from "./rex-tools.ts";
 
 const { values } = parseArgs({ options: { port: { type: "string" } } });
 const portText = values.port ?? String(REX_MCP_HTTP_DEFAULT_PORT);
@@ -18,10 +18,7 @@ if (!/^\d+$/.test(portText) || port > 65_535) {
   throw new Error(`--port ${portText} is not a port number`);
 }
 const runtime = makeRexMcpRuntime();
-const service = await startRexMcpHttpServer({
-  mcp: new RexMcpServer(runtime, rexToolOperations),
-  port,
-});
+const service = await startRexMcpHttpServer({ mcp: new RexMcpServer(runtime, rexTools), port });
 console.error(`rex-mcp: serving ${service.url}`);
 
 async function stop(signal: string): Promise<void> {

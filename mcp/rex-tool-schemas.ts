@@ -1,5 +1,5 @@
 /**
- * JSON Schemas and JSON values for the Rex codemode tools, derived from the SDK's Effect Schemas so
+ * JSON Schemas and JSON values for the Rex tools, derived from the SDK's Effect Schemas so
  * tool parameters and results cannot drift from the SDK.
  *
  * - Parameters: one flat object. SDK positional arguments become named fields, and the SDK's input
@@ -12,7 +12,7 @@ import { Duration, Option, Schema } from "effect";
 /** A JSON Schema node. */
 export type JsonSchema = { readonly [key: string]: unknown };
 
-/** A JSON value returned to codemode scripts as `structuredContent`. */
+/** A JSON value a tool returns. */
 export type RexToolJson =
   | null
   | boolean
@@ -20,9 +20,6 @@ export type RexToolJson =
   | string
   | RexToolJson[]
   | { [key: string]: RexToolJson };
-
-/** JSON Schema of a tool that resolves to nothing. */
-export const rexToolVoidOutputJsonSchema: JsonSchema = { type: "null" };
 
 /** Field accepted by every Rex tool: the local SDK deadline for each request the call makes. */
 export const REX_REQUEST_TIMEOUT_FIELD = "requestTimeoutMs";
@@ -187,7 +184,7 @@ export interface RexToolParameterShape {
  * Flat JSON Schema for a tool's parameters, from the type side of the SDK's schemas. Throws when
  * the input is not an object, so a bad operation table fails at registration and in tests.
  */
-export function rexToolParametersJsonSchema(shape: RexToolParameterShape): JsonSchema {
+export function deriveRexToolParametersJsonSchema(shape: RexToolParameterShape): JsonSchema {
   const definitions = new RexJsonSchemaDefinitions();
   const properties: Record<string, unknown> = {};
   const required = new Set<string>();
@@ -224,8 +221,8 @@ export function rexToolParametersJsonSchema(shape: RexToolParameterShape): JsonS
   if (REX_REQUEST_TIMEOUT_FIELD in properties) {
     throw new Error(`Rex tool parameter "${REX_REQUEST_TIMEOUT_FIELD}" is reserved`);
   }
-  // A plain number keeps every declaration short; the SDK rejects negative or non-finite deadlines.
-  properties[REX_REQUEST_TIMEOUT_FIELD] = { type: "number" };
+  // The SDK takes any duration, and one of zero or less times out every request at once.
+  properties[REX_REQUEST_TIMEOUT_FIELD] = { type: "number", exclusiveMinimum: 0 };
 
   return definitions.attachTo({
     type: "object",
@@ -293,8 +290,12 @@ function rewriteOptions(node: unknown): unknown {
   });
 }
 
-/** JSON Schema of a tool result, matching what {@link encodeRexToolResult} produces. */
-export function rexToolOutputJsonSchema(schema: Schema.Top): JsonSchema {
+/**
+ * JSON Schema of a tool result, matching what {@link encodeRexToolResult} produces: `null` for a
+ * tool that resolves to nothing.
+ */
+export function deriveRexToolOutputJsonSchema(schema: Schema.Top | "void"): JsonSchema {
+  if (schema === "void") return { type: "null" };
   const definitions = new RexJsonSchemaDefinitions();
   const parts = toJsonSchemaParts(Schema.toType(schema));
   const root = definitions.adopt({

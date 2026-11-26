@@ -27,8 +27,7 @@
   "include": [
     "scripts/**/*.ts",
     "src/**/*.ts",
-    "pi/**/*.ts",
-    "cc/**/*.ts",
+    "mcp/**/*.ts",
     "examples/**/*.ts",
     "vite.config.ts"
   ],

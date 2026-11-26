@@ -3,7 +3,7 @@
  * Claude Code's describeTool shows a tool's parameters but not its outputSchema (v2.1.332), so the
  * description is the one place a code-mode script can read what a tool returns.
  */
-import { isJsonObject, type JsonSchema } from "../pi/rex-tool-schemas.ts";
+import { isJsonObject, type JsonSchema } from "./rex-tool-schemas.ts";
 
 const DEFINITION_PREFIX = "#/$defs/";
 const IDENTIFIER = /^[A-Za-z_$][A-Za-z0-9_$]*$/;

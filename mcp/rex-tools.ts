@@ -1,12 +1,13 @@
 /**
- * The Rex operations exposed to codemode, one tool per SDK operation.
+ * The Rex tools: one per SDK operation, plus `here`. This table is the whole agent-facing surface;
+ * the MCP server (rex-mcp-server.ts) serves it as is to every client, Claude Code and pi alike.
  *
- * Tool names mirror the SDK path: `rex.terminals.writeLine` → `rex_terminals_writeLine`. Every
- * operation is deferred: none is listed in the codemode description, and scripts find them
- * through `rex_search`. {@link rexToolExclusions} names every SDK operation left out, and why.
+ * Tool names mirror the SDK path: `rex.terminals.writeLine` → `terminals_writeLine`. Each tool's
+ * input is one flat object and its result is the SDK's value as plain JSON (rex-tool-schemas.ts).
+ * {@link rexToolExclusions} names every SDK operation left out, and why.
  */
-import { Array as Arr, Effect, Schema } from "effect";
-import type { ToolAnnotations } from "@earendil-works/pi-coding-agent";
+import type { ToolAnnotations } from "@modelcontextprotocol/server";
+import { Array as Arr, Effect, Option, Schema } from "effect";
 import {
   AnchorId,
   BlockId,
@@ -29,10 +30,17 @@ import {
   type RexRequestOptions,
   type RexWireMethod,
 } from "../src/index.ts";
-import type { RexMarkStore } from "./rex-tool-marks.ts";
+import type { RexMarkStore } from "./rex-marks.ts";
 
-/** One SDK operation exposed as the codemode tool `rex_<name>`. */
-export interface RexToolOperation {
+/** What a tool call knows besides its arguments: the caller's terminal and the process's marks. */
+export interface RexToolContext {
+  /** The block the calling agent runs in, as its client reports it, or null outside Rex. */
+  readonly callerBlockId: BlockId | null;
+  readonly marks: RexMarkStore;
+}
+
+/** One Rex tool. */
+export interface RexTool {
   /** SDK path with `_` separators, such as `terminals_writeLine`. */
   readonly name: string;
   /** Model-facing description: what it does and returns, then the branch or next step. */
@@ -51,11 +59,11 @@ export interface RexToolOperation {
     rex: IRexSdk,
     params: { readonly [key: string]: unknown },
     options: RexRequestOptions,
-    marks: RexMarkStore,
+    context: RexToolContext,
   ) => Effect.Effect<unknown, unknown>;
 }
 
-interface RexToolOperationBase {
+interface RexToolBase {
   readonly name: string;
   readonly description: string;
   readonly method?: string;
@@ -64,7 +72,7 @@ interface RexToolOperationBase {
   readonly output: Schema.Top | "void";
 }
 
-function annotationsOf(spec: RexToolOperationBase): ToolAnnotations {
+function deriveAnnotations(spec: RexToolBase): ToolAnnotations {
   return {
     readOnlyHint: spec.readOnly ?? false,
     ...(spec.readOnly === true ? {} : { destructiveHint: spec.destructive ?? false }),
@@ -80,33 +88,33 @@ function withoutUndefined(params: { readonly [key: string]: unknown }): {
 
 /** An operation whose parameters are all named fields. */
 function operation<const Fields extends Schema.Struct.Fields>(
-  spec: RexToolOperationBase & {
+  spec: RexToolBase & {
     readonly fields: Fields;
     readonly run: (
       rex: IRexSdk,
       fields: Schema.Struct<Fields>["Type"],
       options: RexRequestOptions,
-      marks: RexMarkStore,
+      context: RexToolContext,
     ) => Effect.Effect<unknown, unknown>;
   },
-): RexToolOperation {
+): RexTool {
   const decodeFields = Schema.decodeUnknownEffect(Schema.toType(Schema.Struct(spec.fields)));
   return {
     name: spec.name,
     description: spec.description,
-    annotations: annotationsOf(spec),
+    annotations: deriveAnnotations(spec),
     method: spec.method,
     fields: spec.fields,
     input: undefined,
     output: spec.output,
-    program: (rex, params, options, marks) =>
-      Effect.flatMap(decodeFields(params), (fields) => spec.run(rex, fields, options, marks)),
+    program: (rex, params, options, context) =>
+      Effect.flatMap(decodeFields(params), (fields) => spec.run(rex, fields, options, context)),
   };
 }
 
 /** An operation with named fields beside the fields of the SDK's input object. */
 function inputOperation<const Fields extends Schema.Struct.Fields, Input extends Schema.Top>(
-  spec: RexToolOperationBase & {
+  spec: RexToolBase & {
     readonly fields: Fields;
     readonly input: Input;
     readonly run: (
@@ -116,13 +124,13 @@ function inputOperation<const Fields extends Schema.Struct.Fields, Input extends
       options: RexRequestOptions,
     ) => Effect.Effect<unknown, unknown>;
   },
-): RexToolOperation {
+): RexTool {
   const decodeFields = Schema.decodeUnknownEffect(Schema.toType(Schema.Struct(spec.fields)));
   const decodeInput = Schema.decodeUnknownEffect(Schema.toType(spec.input));
   return {
     name: spec.name,
     description: spec.description,
-    annotations: annotationsOf(spec),
+    annotations: deriveAnnotations(spec),
     method: spec.method,
     fields: spec.fields,
     input: spec.input,
@@ -150,7 +158,7 @@ function method<Method extends RexWireMethod>(spec: {
     input: RexMethodInput<Method>,
     options: RexRequestOptions,
   ) => Effect.Effect<RexMethodResult<Method>, RexOperationError>;
-}): RexToolOperation {
+}): RexTool {
   const schemas = rexWireMethods[spec.method];
   return inputOperation({
     ...spec,
@@ -172,7 +180,7 @@ function noInputMethod<Method extends RexWireMethod>(spec: {
     rex: IRexSdk,
     options: RexRequestOptions,
   ) => Effect.Effect<RexMethodResult<Method>, RexOperationError>;
-}): RexToolOperation {
+}): RexTool {
   return operation({
     ...spec,
     fields: {},
@@ -197,7 +205,7 @@ function blockMethod<Method extends RexBlockMethod>(spec: {
     args: RexBlockMethodArgs<Method>,
     options: RexRequestOptions,
   ) => Effect.Effect<RexBlockMethodResult<Method>, RexOperationError>;
-}): RexToolOperation {
+}): RexTool {
   const schemas = rexBlockMethods[spec.method];
   return inputOperation({
     ...spec,
@@ -220,7 +228,7 @@ function blockNoArgsMethod<Method extends RexBlockMethod>(spec: {
     target: Schema.Struct<typeof blockTarget>["Type"],
     options: RexRequestOptions,
   ) => Effect.Effect<RexBlockMethodResult<Method>, RexOperationError>;
-}): RexToolOperation {
+}): RexTool {
   return operation({
     ...spec,
     fields: blockTarget,
@@ -366,14 +374,39 @@ const optionalLayoutField = Schema.optionalKey(RexLayoutNode).annotateKey({
   description: layoutDescription,
 });
 
-export const rexToolOperations: readonly RexToolOperation[] = [
-  // The working loop first: find a terminal, run something, wait, read.
+const Here = Schema.Struct({
+  sessionId: Schema.NullOr(SessionId),
+  blockId: Schema.NullOr(BlockId),
+});
+
+export const rexTools: readonly RexTool[] = [
+  // The working loop first: where the agent runs, a terminal, run something, wait, read.
+  operation({
+    name: "here",
+    readOnly: true,
+    description:
+      "The session and terminal block this agent runs in: null for each outside Rex, and a null sessionId when Rex no longer has the block. Nothing defaults to them: pass the IDs explicitly.",
+    fields: {},
+    output: Here,
+    run: (rex, _fields, options, { callerBlockId }) =>
+      callerBlockId === null
+        ? Effect.succeed({ sessionId: null, blockId: null })
+        : Effect.map(
+            rex.targets.resolve({ kinds: ["block"], queries: [callerBlockId] }, options),
+            ({ results }) => ({
+              sessionId: Option.getOrNull(
+                Option.flatMap(results[0]?.target ?? Option.none(), (target) => target.sessionId),
+              ),
+              blockId: callerBlockId,
+            }),
+          ),
+  }),
   method({
     name: "sessions_view",
     method: "session.view",
     readOnly: true,
     description:
-      "One session's windows, layouts, and blocks with their IDs. Start here with the sessionId from rex_search({}).here.",
+      "One session's windows, layouts, and blocks with their IDs. Start here with the sessionId the here tool returns.",
     run: (rex, input, options) => rex.sessions.view(input, options),
   }),
   inputOperation({
@@ -397,10 +430,10 @@ export const rexToolOperations: readonly RexToolOperation[] = [
   operation({
     name: "terminals_writeLine",
     description:
-      "Type a line of text into a terminal and press Return, such as a shell command. Returns a markId taken just before typing: pass it as `since` to rex_terminals_waitForOutput to match only what the command prints.",
+      "Type a line of text into a terminal and press Return, such as a shell command. Returns a markId taken just before typing: pass it as `since` to terminals_waitForOutput to match only what the command prints.",
     fields: { ...blockTarget, text: Schema.String },
     output: MarkResult,
-    run: (rex, { text, ...target }, options, marks) =>
+    run: (rex, { text, ...target }, options, { marks }) =>
       Effect.gen(function* () {
         const mark = yield* rex.terminals.mark(target, options);
         yield* rex.terminals.writeLine(target, text, options);
@@ -410,7 +443,7 @@ export const rexToolOperations: readonly RexToolOperation[] = [
   operation({
     name: "terminals_waitForOutput",
     description:
-      "Wait until a line of a terminal's output matches a substring or regex; `match` has the line, the matched text, capture groups, and how `since` was found. With `since` (a markId from rex_terminals_writeLine or rex_terminals_mark) only output printed after it counts; without it, output already on screen matches at once. Rejects with RexTerminalExited if the program exits first.",
+      "Wait until a line of a terminal's output matches a substring or regex; `match` has the line, the matched text, capture groups, and how `since` was found. With `since` (a markId from terminals_writeLine or terminals_mark) only output printed after it counts; without it, output already on screen matches at once. Fails with RexTerminalExited if the program exits first.",
     fields: {
       ...blockTarget,
       match: OutputPattern,
@@ -427,7 +460,7 @@ export const rexToolOperations: readonly RexToolOperation[] = [
       ...waitTimeout,
     },
     output: waitOutcomeSchema("match", OutputMatch),
-    run: (rex, { match, since, lines, timeoutMs, ...target }, _options, marks) =>
+    run: (rex, { match, since, lines, timeoutMs, ...target }, _options, { marks }) =>
       waitOutcome(
         "match",
         "TerminalService.waitForOutput",
@@ -450,10 +483,10 @@ export const rexToolOperations: readonly RexToolOperation[] = [
     name: "terminals_mark",
     readOnly: true,
     description:
-      "Mark the current end of a terminal's output and return its markId, for `since` in rex_terminals_waitForOutput. rex_terminals_writeLine makes one for you.",
+      "Mark the current end of a terminal's output and return its markId, for `since` in terminals_waitForOutput. terminals_writeLine makes one for you.",
     fields: blockTarget,
     output: MarkResult,
-    run: (rex, target, options, marks) =>
+    run: (rex, target, options, { marks }) =>
       Effect.map(rex.terminals.mark(target, options), (mark) => ({
         markId: marks.put(target, mark),
       })),
@@ -647,7 +680,7 @@ export const rexToolOperations: readonly RexToolOperation[] = [
   method({
     name: "sessions_move",
     method: "session.move",
-    description: "Move a session in the order rex_sessions_list returns.",
+    description: "Move a session in the order sessions_list returns.",
     run: (rex, input, options) => rex.sessions.move(input, options),
   }),
   method({
@@ -669,7 +702,7 @@ export const rexToolOperations: readonly RexToolOperation[] = [
     method: "session.help",
     readOnly: true,
     description:
-      "The methods a session accepts and its blocks provide, as raw JSON. Large; prefer rex_blocks_describe for one block.",
+      "The methods a session accepts and its blocks provide, as raw JSON. Large; prefer blocks_describe for one block.",
     run: (rex, input, options) => rex.sessions.help(input, options),
   }),
 
@@ -726,7 +759,7 @@ export const rexToolOperations: readonly RexToolOperation[] = [
   inputOperation({
     name: "blocks_split",
     description:
-      "Create blocks in a new split beside a block, a split, or a window's focused block, by direction and side. rex_blocks_splitBeside is simpler.",
+      "Create blocks in a new split beside a block, a split, or a window's focused block, by direction and side. blocks_splitBeside is simpler.",
     fields: { layout: layoutField },
     input: rexWireMethods["session.new_split"].input,
     output: rexWireMethods["session.new_split"].result,
@@ -736,7 +769,7 @@ export const rexToolOperations: readonly RexToolOperation[] = [
   method({
     name: "blocks_create",
     method: "session.new_block",
-    description: "Create a detached block from a flavor, to place later with rex_blocks_move.",
+    description: "Create a detached block from a flavor, to place later with blocks_move.",
     run: (rex, input, options) => rex.blocks.create(input, options),
   }),
   method({
@@ -835,14 +868,14 @@ export const rexToolOperations: readonly RexToolOperation[] = [
     name: "blocks_sendEvent",
     method: "block.event",
     description:
-      "Send an input event, such as a key press or a paste, to a block. To type text into a terminal, use rex_terminals_write.",
+      "Send an input event, such as a key press or a paste, to a block. To type text into a terminal, use terminals_write.",
     run: (rex, input, options) => rex.blocks.sendEvent(input, options),
   }),
   method({
     name: "blocks_callMethod",
     method: "block.method",
     description:
-      "Call a method of any block by name and return its raw result; rex_blocks_describe lists them.",
+      "Call a method of any block by name and return its raw result; blocks_describe lists them.",
     run: (rex, input, options) => rex.blocks.callMethod(input, options),
   }),
 
@@ -902,7 +935,7 @@ export const rexToolOperations: readonly RexToolOperation[] = [
     method: "com.superlogical.terminal.format",
     readOnly: true,
     description:
-      "The screen and scrollback as text, html, or vt, possibly only the first part. rex_terminals_read pages through the rest for you.",
+      "The screen and scrollback as text, html, or vt, possibly only the first part. terminals_read pages through the rest for you.",
     run: (rex, target, args, options) => rex.terminals.format(target, args, options),
   }),
   blockMethod({
@@ -1060,7 +1093,7 @@ export const rexToolOperations: readonly RexToolOperation[] = [
   operation({
     name: "tunnels_createDial",
     description:
-      "Create a detached tunnel block that connects to a fixed host and port; place it with rex_blocks_move.",
+      "Create a detached tunnel block that connects to a fixed host and port; place it with blocks_move.",
     fields: {
       sessionId: SessionId,
       label: Schema.optionalKey(Schema.String),
@@ -1072,7 +1105,7 @@ export const rexToolOperations: readonly RexToolOperation[] = [
   operation({
     name: "tunnels_createListen",
     description:
-      "Create a detached tunnel block that accepts connections on an address and port; place it with rex_blocks_move.",
+      "Create a detached tunnel block that accepts connections on an address and port; place it with blocks_move.",
     fields: {
       sessionId: SessionId,
       label: Schema.optionalKey(Schema.String),
@@ -1237,19 +1270,19 @@ export const rexToolOperations: readonly RexToolOperation[] = [
 export const rexToolExclusions: Readonly<Record<string, string>> = {
   "sessions.attach": "the SDK attaches automatically for every session-scoped call",
   "sessions.detach": "the SDK manages this connection's attachments",
-  "sessions.attachAll": "the SDK manages this connection's attachments; use rex_events_waitFor",
+  "sessions.attachAll": "the SDK manages this connection's attachments; use events_waitFor",
   "sessions.bootstrap": "starts a client connection, which only app clients need",
-  "sessions.watchView": "a stream; read rex_sessions_view again instead",
-  "terminals.stream": "a stream; use rex_terminals_waitForOutput and rex_terminals_read",
-  "terminals.activity": "a stream; use rex_terminals_waitForOutput or rex_terminals_waitForQuiet",
-  "terminals.watch": "a stream; use rex_terminals_waitForOutput",
-  "terminals.download": "a scoped byte stream; use rex_terminals_readFile",
-  "terminals.downloadToFile": "needs a local file system service; use rex_terminals_readFile",
+  "sessions.watchView": "a stream; read sessions_view again instead",
+  "terminals.stream": "a stream; use terminals_waitForOutput and terminals_read",
+  "terminals.activity": "a stream; use terminals_waitForOutput or terminals_waitForQuiet",
+  "terminals.watch": "a stream; use terminals_waitForOutput",
+  "terminals.download": "a scoped byte stream; use terminals_readFile",
+  "terminals.downloadToFile": "needs a local file system service; use terminals_readFile",
   "tunnels.openStream": "a scoped byte stream",
   "tunnels.connections": "a stream",
   "tunnels.forwardLocal": "a forward lives only as long as its scope",
   "tunnels.forwardRemote": "a forward lives only as long as its scope",
   "clients.servePerformRequests": "serves requests until interrupted",
   "clients.serveCallRequests": "serves requests until interrupted",
-  "events.stream": "a stream; use rex_events_waitFor",
+  "events.stream": "a stream; use events_waitFor",
 };

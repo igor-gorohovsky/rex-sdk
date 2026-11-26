@@ -34,7 +34,7 @@ API revision 18** only.
 | Byte streams, file transfers, forwards | `src/rex-bytes-stream.ts`, `src/rex-file-transfer.ts`, `src/rex-tunnel-forward.ts`; contract in `docs/research/rex-data-bytes-v1.md` |
 | Layout trees                           | `src/rex-layout.ts`                                                                                                                  |
 | Errors                                 | `src/rex-errors.ts`                                                                                                                  |
-| pi extension (codemode tools)          | `pi/` (`pi/README.md`); a new SDK operation needs a tool row or a `rexToolExclusions` entry                                          |
+| MCP server (agent tools)               | `mcp/` (`mcp/README.md`); a new SDK operation needs a row in `mcp/rex-tools.ts` or a `rexToolExclusions` entry                       |
 
 ## Local rules
 

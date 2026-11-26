@@ -129,13 +129,16 @@ Each failure is a tagged error, so you can recover with `Effect.catchTag`:
 - **Streams**: `RexEventsLost`, `RexDataRejected`, `RexBlockClosed`, `RexDataStreamFailed`.
 - **Contract**: `RexInvalidResponse`, when the server's answer doesn't match API revision 18.
 
-## pi extension
+## MCP server
 
-The [`pi/`](pi/README.md) directory is a [pi](https://pi.dev) extension that gives codemode
-scripts one tool per SDK operation (`rex_terminals_writeLine`, `rex_sessions_view`, …):
+The [`mcp/`](mcp/README.md) directory serves this SDK to agents as an MCP server: one tool per
+SDK operation (`terminals_writeLine`, `sessions_view`, …), for Claude Code, pi, and any other MCP
+client. One process can serve every agent on a machine:
 
 ```sh
-pi install git:github.com/dmmulroy/rex-sdk
+node mcp/http.ts --port 7317
+claude mcp add -s user --transport http rex http://127.0.0.1:7317/mcp -H 'X-Rex-Block: ${REX_BLOCK:-}'
+pi mcp add rex --url http://127.0.0.1:7317/mcp --header 'X-Rex-Block=${REX_BLOCK}'
 ```
 
 ## Development

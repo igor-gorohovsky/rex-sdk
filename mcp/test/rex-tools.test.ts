@@ -1,14 +1,12 @@
 /**
- * Calls every Rex codemode tool the way pi does (validate against the tool's parameter schema,
- * then execute) against the SDK's test server, never a live Rex server.
+ * Calls every Rex tool the way an MCP client does (`tools/call` with flat arguments, a JSON text
+ * result or an error result) against the SDK's test server, never a live Rex server.
  */
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { validateToolArguments } from "@earendil-works/pi-ai/utils/validation";
-import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
+import type { CallToolResult } from "@modelcontextprotocol/server";
 import { Ajv2020 } from "ajv/dist/2020.js";
 import { Effect, Exit, Layer, Schema, Scope } from "effect";
-import type { TSchema } from "typebox";
 import { afterAll, beforeAll, describe, expect, test } from "vite-plus/test";
 import {
   BlockId,
@@ -26,17 +24,10 @@ import {
   type IRexTestServer,
   type RexTestServerBytesPeer,
 } from "../../src/testing/rex-test-server.ts";
-import {
-  registerRexCodemodeTools,
-  rexHereFromEnv,
-  rexToolNamespace,
-  shouldRegisterRexTools,
-  type RexCodemodeTool,
-} from "../index.ts";
-import { rexToolExclusions, rexToolOperations } from "../rex-tool-operations.ts";
-import { RexToolError, type RexToolRuntime } from "../rex-tool-runtime.ts";
-import { encodeRexToolResult } from "../rex-tool-schemas.ts";
-import { REX_SEARCH_DEFAULT_LIMIT, REX_SEARCH_TOOL_NAME } from "../rex-tool-search.ts";
+import { RexMcpServer } from "../rex-mcp-server.ts";
+import { RexToolRuntime } from "../rex-tool-runtime.ts";
+import { deriveRexToolOutputJsonSchema, encodeRexToolResult } from "../rex-tool-schemas.ts";
+import { rexToolExclusions, rexTools } from "../rex-tools.ts";
 
 const uuid = "01234567-89ab-cdef-0123-456789abcdef";
 const sessionId = SessionId.make(`session:${uuid}`);
@@ -51,7 +42,6 @@ const shellBlockId = BlockId.make("block:01234567-89ab-cdef-0123-000000000003");
 
 const Json = Schema.Json;
 const decodeJsonText = Schema.decodeUnknownSync(Schema.fromJsonString(Json));
-const decodeJsonObject = Schema.decodeUnknownSync(Schema.Record(Schema.String, Json));
 
 function fieldOf(value: unknown, ...path: ReadonlyArray<string | number>): unknown {
   let current = value;
@@ -60,10 +50,6 @@ function fieldOf(value: unknown, ...path: ReadonlyArray<string | number>): unkno
     current = Object.getOwnPropertyDescriptor(current, key)?.value;
   }
   return current;
-}
-
-function arrayOf(value: unknown): ReadonlyArray<unknown> {
-  return Array.isArray(value) ? value : [];
 }
 
 function objectOf(value: unknown): { readonly [key: string]: unknown } {
@@ -112,36 +98,36 @@ const layout = { _tag: "Split", direction: "horizontal", before: terminal, after
 
 /** Arguments for tools that do more than pass one documented example through. */
 const customArguments: { readonly [tool: string]: { readonly [key: string]: unknown } } = {
-  rex_search: { query: "terminal" },
-  rex_blocks_splitBeside: { sessionId, anchorId: blockId, placement: "right", layout: terminal },
-  rex_terminals_writeLine: { ...here, text: "ls" },
-  rex_terminals_waitForOutput: {
+  here: {},
+  blocks_splitBeside: { sessionId, anchorId: blockId, placement: "right", layout: terminal },
+  terminals_writeLine: { ...here, text: "ls" },
+  terminals_waitForOutput: {
     ...here,
     match: { type: "regex", value: "\\bls$" },
     timeoutMs: 2_000,
   },
-  rex_terminals_waitForExit: { sessionId, blockId: exitedBlockId, timeoutMs: 2_000 },
-  rex_terminals_waitForQuiet: { ...here, quietForMs: 50, timeoutMs: 2_000 },
-  rex_terminals_mark: here,
-  rex_terminals_readTail: { ...here, maxBytes: 4_096 },
-  rex_terminals_read: { ...here, trim: true, unwrap: true },
-  rex_terminals_readFile: { ...here, path: "report.csv" },
-  rex_terminals_pasteFiles: { ...here, files: [{ name: "notes.txt", text: "hello" }] },
-  rex_sessions_create: { label: "fixture", initialWindows: [{ windowLabel: "Code", layout }] },
-  rex_windows_create: { sessionId, windowLabel: "Code", layout },
-  rex_blocks_split: { sessionId, anchorId: blockId, direction: "vertical", side: "after", layout },
-  rex_layers_create: { sessionId, bounds: [0.1, 0.1, 0.5, 0.5], layout: terminal },
-  rex_tunnels_createDial: { sessionId, options: { host: "127.0.0.1", port: 5432 } },
-  rex_tunnels_createListen: { sessionId, label: "web", options: { port: 0 } },
-  rex_events_waitFor: { type: "session_destroyed", sessionId, timeoutMs: 2_000 },
+  terminals_waitForExit: { sessionId, blockId: exitedBlockId, timeoutMs: 2_000 },
+  terminals_waitForQuiet: { ...here, quietForMs: 50, timeoutMs: 2_000 },
+  terminals_mark: here,
+  terminals_readTail: { ...here, maxBytes: 4_096 },
+  terminals_read: { ...here, trim: true, unwrap: true },
+  terminals_readFile: { ...here, path: "report.csv" },
+  terminals_pasteFiles: { ...here, files: [{ name: "notes.txt", text: "hello" }] },
+  sessions_create: { label: "fixture", initialWindows: [{ windowLabel: "Code", layout }] },
+  windows_create: { sessionId, windowLabel: "Code", layout },
+  blocks_split: { sessionId, anchorId: blockId, direction: "vertical", side: "after", layout },
+  layers_create: { sessionId, bounds: [0.1, 0.1, 0.5, 0.5], layout: terminal },
+  tunnels_createDial: { sessionId, options: { host: "127.0.0.1", port: 5432 } },
+  tunnels_createListen: { sessionId, label: "web", options: { port: 0 } },
+  events_waitFor: { type: "session_destroyed", sessionId, timeoutMs: 2_000 },
 };
 
 function argumentsFor(toolName: string): { readonly [key: string]: unknown } {
   const custom = customArguments[toolName];
   if (custom !== undefined) return custom;
-  const operation = rexToolOperations.find((candidate) => `rex_${candidate.name}` === toolName);
-  if (operation?.method === undefined) throw new Error(`no arguments for ${toolName}`);
-  return argumentsFromExample(operation.method);
+  const tool = rexTools.find((candidate) => candidate.name === toolName);
+  if (tool?.method === undefined) throw new Error(`no arguments for ${toolName}`);
+  return argumentsFromExample(tool.method);
 }
 
 /** Server and block methods no tool reaches. */
@@ -215,118 +201,104 @@ function handleEverything(server: IRexTestServer) {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Registration and calls, as pi makes them.
+// Calls, as an MCP client makes them.
 
-interface Registered {
-  readonly tools: ReadonlyMap<string, RexCodemodeTool>;
-  readonly registered: ReadonlyArray<ToolDefinition<TSchema, undefined>>;
-  readonly shutdown: Array<() => unknown>;
-  readonly runtime: RexToolRuntime;
-}
-
-function register(socketPath: string): Registered {
-  const registered: Array<ToolDefinition<TSchema, undefined>> = [];
-  const shutdown: Array<() => unknown> = [];
-  const { tools, runtime } = registerRexCodemodeTools(
-    {
-      registerTool: (tool) => {
-        registered.push(tool);
-      },
-      on: (_event, handler) => shutdown.push(handler),
-    },
-    {
-      here: { sessionId, blockId },
-      makeLayer: () =>
-        rexSdkLayerFromOptions({
-          server: socketPath,
-          client: { kind: "agent", name: "rex-codemode-test", version: "0.0.0" },
-          requestTimeout: "2 seconds",
-        }),
-    },
+function makeRuntime(socketPath: string): RexToolRuntime {
+  return new RexToolRuntime(() =>
+    rexSdkLayerFromOptions({
+      server: socketPath,
+      client: { kind: "agent", name: "rex-mcp-test", version: "0.0.0" },
+      requestTimeout: "2 seconds",
+    }),
   );
-  return { tools, registered, shutdown, runtime };
 }
 
-/** Validates like pi does for a model or script call, then executes. */
-async function callTool(
-  tools: ReadonlyMap<string, RexCodemodeTool>,
-  name: string,
-  args: { readonly [key: string]: unknown },
-  signal?: AbortSignal,
-) {
-  const tool = tools.get(name);
-  if (tool === undefined) throw new Error(`tool ${name} is not registered`);
-  const validated: unknown = validateToolArguments(tool.definition, {
-    type: "toolCall",
-    id: "call-1",
-    name,
-    arguments: decodeJsonObject(args),
-  });
-  return tool.call(validated, signal);
+/** A failed call: the error tag and the whole text. */
+class ToolError extends Error {
+  readonly tag: string;
+
+  constructor(text: string) {
+    super(text);
+    this.tag = text.split(":")[0] ?? "";
+  }
 }
 
-async function rejection(promise: Promise<unknown>): Promise<RexToolError> {
+const TextResult = Schema.Struct({
+  content: Schema.Tuple([Schema.Struct({ type: Schema.Literal("text"), text: Schema.String })]),
+  isError: Schema.optionalKey(Schema.Boolean),
+});
+const decodeTextResult = Schema.decodeUnknownSync(TextResult);
+
+/** The parsed JSON of a result, or a ToolError for an error result. */
+function readResult(result: CallToolResult): unknown {
+  const { content, isError } = decodeTextResult(result);
+  if (isError === true) throw new ToolError(content[0].text);
+  return decodeJsonText(content[0].text);
+}
+
+async function awaitToolError(promise: Promise<unknown>): Promise<ToolError> {
   try {
     await promise;
   } catch (error) {
-    if (error instanceof RexToolError) return error;
+    if (error instanceof ToolError) return error;
     throw error;
   }
-  throw new Error("expected the call to reject");
+  throw new Error("expected the call to fail");
 }
 
 // ---------------------------------------------------------------------------------------------
 
-describe("rex codemode tools", () => {
+describe("rex tools", () => {
   let scope: Scope.Closeable;
   let server: IRexTestServer;
-  let tools: Registered;
+  let runtime: RexToolRuntime;
+  let mcp: RexMcpServer;
+
+  /** Calls a tool as a client in `here`, resolving to its parsed result. */
+  const callTool = async (
+    name: string,
+    args: { readonly [key: string]: unknown },
+    signal?: AbortSignal,
+  ) => readResult(await mcp.callTool(name, args, blockId, signal));
 
   beforeAll(async () => {
     scope = await Effect.runPromise(Scope.make());
     server = await Effect.runPromise(startRexTestServer().pipe(Scope.provide(scope)));
     handleEverything(server);
-    tools = register(server.socketPath);
+    runtime = makeRuntime(server.socketPath);
+    mcp = new RexMcpServer(runtime, rexTools);
   });
 
   afterAll(async () => {
-    for (const handler of tools.shutdown) await handler();
+    await runtime.dispose();
     await Effect.runPromise(Scope.close(scope, Exit.void));
   });
 
-  test("lists only rex_search; every operation tool is deferred in the rex namespace", () => {
-    expect(tools.registered.length).toBe(rexToolOperations.length + 1);
-    expect(new Set(tools.registered.map((tool) => tool.name)).size).toBe(tools.registered.length);
-    const listed = tools.registered.filter((tool) => tool.exposure === "codemode");
-    expect(listed.map((tool) => tool.name)).toEqual([REX_SEARCH_TOOL_NAME]);
-    for (const tool of tools.registered) {
-      expect(tool.namespace).toBe(rexToolNamespace);
-      if (tool.name === REX_SEARCH_TOOL_NAME) continue;
-      expect(tool.exposure).toBe("deferred");
-      expect(tool.name).toMatch(/^rex_[a-z][A-Za-z]*(_[a-z][A-Za-z]*)+$/);
-    }
-  });
-
   test("every SDK operation has a tool or a stated exclusion", async () => {
-    const exit = await tools.runtime.run(
+    const rex = await Effect.runPromise(
       Effect.gen(function* () {
         return yield* RexSdk;
-      }),
-      undefined,
+      }).pipe(
+        Effect.provide(
+          rexSdkLayerFromOptions({
+            server: server.socketPath,
+            client: { kind: "agent", name: "rex-mcp-test", version: "0.0.0" },
+          }),
+        ),
+      ),
     );
-    if (!Exit.isSuccess(exit)) throw new Error("the SDK did not build");
     const sdkPaths: string[] = [];
     const collect = (value: unknown, path: string) => {
       if (typeof value === "function") sdkPaths.push(path);
       else if (typeof value === "object" && value !== null)
         for (const [key, child] of Object.entries(value)) collect(child, `${path}.${key}`);
     };
-    for (const [namespace, service] of Object.entries(exit.value)) {
+    for (const [namespace, service] of Object.entries(objectOf(rex))) {
       if (namespace === "config" || namespace === "ids") continue;
       collect(service, namespace);
     }
     const toolPaths = new Set(
-      rexToolOperations.map((operation) => operation.name.replaceAll("_", ".")),
+      rexTools.filter((tool) => tool.name !== "here").map((tool) => tool.name.replaceAll("_", ".")),
     );
     const excluded = new Set(Object.keys(rexToolExclusions));
     expect(sdkPaths.filter((path) => !toolPaths.has(path) && !excluded.has(path))).toEqual([]);
@@ -336,71 +308,19 @@ describe("rex codemode tools", () => {
     expect([...toolPaths].filter((path) => !sdkPaths.includes(path))).toEqual([]);
   });
 
-  test("rex_search: table of contents with here, capped ranked hits, namespace filter, no traffic", async () => {
-    const firstRequest = server.requests().length;
-    const search = async (args: { readonly [key: string]: unknown }) =>
-      (await callTool(tools.tools, REX_SEARCH_TOOL_NAME, args)).structuredContent;
-
-    const contents = await search({});
-    expect(fieldOf(contents, "instructions")).toBe(rexToolNamespace.instructions);
-    expect(fieldOf(contents, "here")).toEqual({ sessionId, blockId });
-    const namespaces = arrayOf(fieldOf(contents, "namespaces"));
-    const counted = namespaces.reduce<number>((sum, namespace) => {
-      const count = fieldOf(namespace, "tools");
-      return sum + (typeof count === "number" ? count : 0);
-    }, 0);
-    expect(counted).toBe(rexToolOperations.length);
-    expect(namespaces.map((namespace) => fieldOf(namespace, "name"))).toContain("terminals");
-    expect(JSON.stringify(contents).length / 4).toBeLessThan(1_800);
-
-    const waits = await search({ query: "wait terminal output" });
-    expect(fieldOf(waits, "tools", 0, "name")).toBe("rex_terminals_waitForOutput");
-    expect(arrayOf(fieldOf(waits, "tools")).length).toBe(REX_SEARCH_DEFAULT_LIMIT);
-
-    const closes = arrayOf(fieldOf(await search({ query: "close", limit: 50 }), "tools"));
-    expect(
-      closes.some(
-        (hit) =>
-          fieldOf(hit, "name") === "rex_windows_close" && fieldOf(hit, "destructive") === true,
-      ),
-    ).toBe(true);
-    const read = arrayOf(fieldOf(await search({ query: "read terminal" }), "tools")).find(
-      (hit) => fieldOf(hit, "name") === "rex_terminals_read",
-    );
-    expect(Object.keys(objectOf(read)).toSorted()).toEqual(["description", "name"]);
-
-    const terminals = arrayOf(
-      fieldOf(await search({ namespace: "terminals", limit: 50 }), "tools"),
-    );
-    expect(terminals.length).toBeGreaterThan(10);
-    expect(
-      terminals.every((hit) => String(fieldOf(hit, "name")).startsWith("rex_terminals_")),
-    ).toBe(true);
-
-    expect(await search({ query: "zzzz" })).toEqual({ tools: [], total: 0 });
-    expect(server.requests().length).toBe(firstRequest);
-  });
-
-  test("every tool crosses the socket and resolves to JSON matching its output schema", async () => {
+  test("every tool crosses the socket and resolves to JSON text matching its result type", async () => {
     const ajv = new Ajv2020({ strict: false, allErrors: true });
     const firstRequest = server.requests().length;
-    for (const tool of tools.registered) {
-      if (tool.name === "rex_events_waitFor") {
+    for (const tool of rexTools) {
+      if (tool.name === "events_waitFor") {
         setTimeout(
           () => server.emit({ type: "session_destroyed", payload: { session_id: sessionId } }),
           200,
         );
       }
-      const result = await callTool(tools.tools, tool.name, argumentsFor(tool.name));
-      expect(result.structuredContent, tool.name).not.toBeUndefined();
-      expect(JSON.parse(JSON.stringify(result.structuredContent))).toEqual(
-        result.structuredContent,
-      );
-      const validate = ajv.compile(objectOf(tool.outputSchema));
-      expect(
-        validate(result.structuredContent),
-        `${tool.name}: ${ajv.errorsText(validate.errors)}`,
-      ).toBe(true);
+      const result = await callTool(tool.name, argumentsFor(tool.name));
+      const validate = ajv.compile(deriveRexToolOutputJsonSchema(tool.output));
+      expect(validate(result), `${tool.name}: ${ajv.errorsText(validate.errors)}`).toBe(true);
     }
     const observed = new Set(
       server
@@ -415,16 +335,28 @@ describe("rex codemode tools", () => {
     expect(server.violations()).toEqual([]);
   });
 
+  test("here returns the caller's block and the session Rex finds it in", async () => {
+    const firstRequest = server.requests().length;
+    // The documented target.resolve example resolves its first query in sessionId.
+    expect(await callTool("here", {})).toEqual(here);
+    expect(server.requests().slice(firstRequest)).toMatchObject([
+      { method: "target.resolve", payload: { kinds: ["block"], queries: [blockId] } },
+    ]);
+    const outside = readResult(await mcp.callTool("here", {}, null, undefined));
+    expect(outside).toEqual({ sessionId: null, blockId: null });
+    expect(server.requests().length).toBe(firstRequest + 1);
+  });
+
   test("flat parameters reach the wire as the SDK's positional arguments and input", async () => {
     const firstRequest = server.requests().length;
-    await callTool(tools.tools, "rex_terminals_read", { ...here, trim: true });
-    await callTool(tools.tools, "rex_blocks_splitBeside", {
+    await callTool("terminals_read", { ...here, trim: true });
+    await callTool("blocks_splitBeside", {
       sessionId,
       anchorId: blockId,
       placement: "left",
       ratio: 0.3,
     });
-    await callTool(tools.tools, "rex_windows_create", { sessionId, layout: terminal });
+    await callTool("windows_create", { sessionId, layout: terminal });
     const sent = (method: string) =>
       server
         .requests()
@@ -455,91 +387,92 @@ describe("rex codemode tools", () => {
     });
   });
 
-  test("rejects before any request when parameters do not match the schema", async () => {
+  test("fails with SchemaError before any request when parameters do not match the schema", async () => {
     const firstRequest = server.requests().length;
-    await expect(callTool(tools.tools, "rex_terminals_writeLine", here)).rejects.toThrow(
-      /Validation failed/,
-    );
-    await expect(
-      callTool(tools.tools, "rex_sessions_view", { sessionId, extra: 1 }),
-    ).rejects.toThrow(/Validation failed/);
-    for (const name of [
-      "rex_terminals_waitForOutput",
-      "rex_terminals_waitForExit",
-      "rex_events_waitFor",
-    ]) {
+    const missingText = await awaitToolError(callTool("terminals_writeLine", here));
+    expect(missingText.tag).toBe("SchemaError");
+    const extra = await awaitToolError(callTool("sessions_view", { sessionId, extra: 1 }));
+    expect(extra.message).toBe('SchemaError: unknown field "extra"');
+    for (const name of ["terminals_waitForOutput", "terminals_waitForExit", "events_waitFor"]) {
       const { timeoutMs: _timeoutMs, ...withoutTimeout } = argumentsFor(name);
-      await expect(callTool(tools.tools, name, withoutTimeout)).rejects.toThrow(/timeoutMs/);
+      const error = await awaitToolError(callTool(name, withoutTimeout));
+      expect(error.tag).toBe("SchemaError");
+      expect(error.message).toMatch(/timeoutMs/);
     }
-    const malformed = await rejection(
-      callTool(tools.tools, "rex_sessions_view", { sessionId: "not-a-session" }),
+    const malformed = await awaitToolError(
+      callTool("sessions_view", { sessionId: "not-a-session" }),
     );
     expect(malformed.tag).toBe("SchemaError");
+    // The deadline every tool takes is checked too, though no tool's own schema decodes it.
+    for (const requestTimeoutMs of ["100", 0, -1, null]) {
+      const deadline = await awaitToolError(callTool("hosts_list", { requestTimeoutMs }));
+      expect(deadline.tag).toBe("SchemaError");
+      expect(deadline.message).toContain("requestTimeoutMs");
+    }
+    const unknownTool = await awaitToolError(callTool("search", {}));
+    expect(unknownTool.message).toBe("RexUnknownTool: no Rex tool is named search");
     expect(server.requests().length).toBe(firstRequest);
   });
 
   test("a wait that passes its timeoutMs resolves to { timedOut: true }", async () => {
-    const output = await callTool(tools.tools, "rex_terminals_waitForOutput", {
+    const output = await callTool("terminals_waitForOutput", {
       ...here,
       match: { type: "substring", value: "never printed" },
       timeoutMs: 300,
     });
-    expect(output.structuredContent).toEqual({ timedOut: true });
-    const exit = await callTool(tools.tools, "rex_terminals_waitForExit", {
-      ...here,
-      timeoutMs: 300,
-    });
-    expect(exit.structuredContent).toEqual({ timedOut: true });
-    const event = await callTool(tools.tools, "rex_events_waitFor", {
-      type: "never_sent",
-      timeoutMs: 300,
-    });
-    expect(event.structuredContent).toEqual({ timedOut: true });
+    expect(output).toEqual({ timedOut: true });
+    const exit = await callTool("terminals_waitForExit", { ...here, timeoutMs: 300 });
+    expect(exit).toEqual({ timedOut: true });
+    const event = await callTool("events_waitFor", { type: "never_sent", timeoutMs: 300 });
+    expect(event).toEqual({ timedOut: true });
   });
 
   test("waits resolve to { timedOut: false, value } with the SDK's result", async () => {
     // Output already on screen matches without a mark, even after the program exited.
-    const output = await callTool(tools.tools, "rex_terminals_waitForOutput", {
+    const output = await callTool("terminals_waitForOutput", {
       sessionId,
       blockId: exitedBlockId,
       match: { type: "regex", value: "^(\\w+)$" },
       timeoutMs: 1_000,
     });
-    expect(output.structuredContent).toEqual({
+    expect(output).toEqual({
       timedOut: false,
       match: { line: "done", text: "done", groups: ["done"], alignment: null },
     });
-    const exit = await callTool(tools.tools, "rex_terminals_waitForExit", {
+    const exit = await callTool("terminals_waitForExit", {
       sessionId,
       blockId: exitedBlockId,
       timeoutMs: 1_000,
     });
-    expect(exit.structuredContent).toEqual({ timedOut: false, exit: { exitCode: 0, error: null } });
+    expect(exit).toEqual({ timedOut: false, exit: { exitCode: 0, error: null } });
   });
 
   test("writeLine returns a mark; waitForOutput since it matches only what the command printed", async () => {
     const shell = { sessionId, blockId: shellBlockId };
     const terminal = startRexTestTerminal(server, shell, { content: "$ pnpm test\npassed\n$ " });
-    const written = await callTool(tools.tools, "rex_terminals_writeLine", {
-      ...shell,
-      text: "pnpm test",
-    });
-    const markId = fieldOf(written.structuredContent, "markId");
-    expect(markId).toMatch(/^mark-\d+$/);
-    const wait = callTool(tools.tools, "rex_terminals_waitForOutput", {
-      ...shell,
-      since: markId,
-      match: { type: "regex", value: "passed|failed" },
-      timeoutMs: 2_000,
-    });
+    const written = await callTool("terminals_writeLine", { ...shell, text: "pnpm test" });
+    const markId = fieldOf(written, "markId");
+    expect(markId).toMatch(/^mark-[0-9a-f-]{36}$/);
+    // Marks belong to the process, not to a client: another client may wait on it.
+    const wait = mcp.callTool(
+      "terminals_waitForOutput",
+      {
+        ...shell,
+        since: markId,
+        match: { type: "regex", value: "passed|failed" },
+        timeoutMs: 2_000,
+      },
+      null,
+      undefined,
+    );
     // The earlier "passed" line and the typed command don't count; this does.
     setTimeout(() => terminal.print("1 failed\n$ "), 300);
-    expect((await wait).structuredContent).toEqual({
+    expect(readResult(await wait)).toEqual({
       timedOut: false,
       match: { line: "1 failed", text: "failed", groups: [], alignment: "offset" },
     });
-    const otherBlock = await rejection(
-      callTool(tools.tools, "rex_terminals_waitForOutput", {
+    const otherBlock = await awaitToolError(
+      callTool("terminals_waitForOutput", {
         ...here,
         since: markId,
         match: { type: "substring", value: "x" },
@@ -547,11 +480,12 @@ describe("rex codemode tools", () => {
       }),
     );
     expect(otherBlock.tag).toBe("RexUnknownMark");
+    expect(otherBlock.message).toContain("terminals_mark or terminals_writeLine");
   });
 
-  test("waitForOutput rejects with RexTerminalExited when the program exits without a match", async () => {
-    const error = await rejection(
-      callTool(tools.tools, "rex_terminals_waitForOutput", {
+  test("waitForOutput fails with RexTerminalExited when the program exits without a match", async () => {
+    const error = await awaitToolError(
+      callTool("terminals_waitForOutput", {
         sessionId,
         blockId: exitedBlockId,
         match: { type: "substring", value: "never printed" },
@@ -561,14 +495,12 @@ describe("rex codemode tools", () => {
     expect(error.tag).toBe("RexTerminalExited");
   });
 
-  test("a server rejection rejects with the SDK error tag first", async () => {
+  test("a server rejection fails with the SDK error tag first", async () => {
     server.handle("session.list_blocks", () =>
       Effect.succeed(rexTestServerError("session_not_found", "no such session")),
     );
     try {
-      const error = await rejection(
-        callTool(tools.tools, "rex_sessions_listBlocks", { sessionId }),
-      );
+      const error = await awaitToolError(callTool("sessions_listBlocks", { sessionId }));
       expect(error.tag).toBe("RexSessionNotFound");
       expect(error.message).toMatch(/^RexSessionNotFound: /);
     } finally {
@@ -582,9 +514,7 @@ describe("rex codemode tools", () => {
     server.handle("hosts.list", () => Effect.never);
     try {
       const started = Date.now();
-      const error = await rejection(
-        callTool(tools.tools, "rex_hosts_list", { requestTimeoutMs: 100 }),
-      );
+      const error = await awaitToolError(callTool("hosts_list", { requestTimeoutMs: 100 }));
       expect(error.tag).toBe("RexRequestTimeout");
       expect(Date.now() - started).toBeLessThan(1_500);
     } finally {
@@ -597,46 +527,32 @@ describe("rex codemode tools", () => {
   test("aborting the tool call interrupts it", async () => {
     const controller = new AbortController();
     const call = callTool(
-      tools.tools,
-      "rex_terminals_waitForOutput",
+      "terminals_waitForOutput",
       { ...here, match: { type: "substring", value: "never printed" }, timeoutMs: 60_000 },
       controller.signal,
     );
     setTimeout(() => controller.abort(), 50);
     const started = Date.now();
-    expect((await rejection(call)).tag).toBe("Interrupted");
+    expect((await awaitToolError(call)).tag).toBe("Interrupted");
     expect(Date.now() - started).toBeLessThan(2_000);
   });
 });
 
-test("a missing server rejects with the SDK's connection error, and the runtime recovers", async () => {
-  const { tools, runtime } = registerRexCodemodeTools(
-    { registerTool: () => undefined, on: () => undefined },
-    {
-      here: { sessionId: null, blockId: null },
-      makeLayer: () =>
-        Layer.fresh(
-          rexSdkLayerFromOptions({
-            server: "/tmp/rex-codemode-missing/server.sock",
-            connectTimeout: "1 second",
-          }),
-        ),
-    },
+test("a missing server fails with the SDK's connection error", async () => {
+  const runtime = new RexToolRuntime(() =>
+    Layer.fresh(
+      rexSdkLayerFromOptions({
+        server: "/tmp/rex-mcp-missing/server.sock",
+        connectTimeout: "1 second",
+      }),
+    ),
   );
   try {
-    const error = await rejection(callTool(tools, "rex_server_status", {}));
+    const mcp = new RexMcpServer(runtime, rexTools);
+    const result = await mcp.callTool("server_status", {}, blockId, undefined);
+    const error = await awaitToolError(Promise.resolve().then(() => readResult(result)));
     expect(error.tag).toMatch(/^RexConnection/);
   } finally {
     await runtime.dispose();
   }
-});
-
-test("tools register only inside Rex unless forced", () => {
-  expect(shouldRegisterRexTools({})).toBe(false);
-  expect(shouldRegisterRexTools({ REX_SESSION: sessionId })).toBe(true);
-  expect(shouldRegisterRexTools({ REX_SERVER: "/tmp/rex.sock" })).toBe(true);
-  expect(shouldRegisterRexTools({ PI_REX_CODEMODE: "1" })).toBe(true);
-  expect(shouldRegisterRexTools({ REX_SESSION: sessionId, PI_REX_CODEMODE: "0" })).toBe(false);
-  expect(rexHereFromEnv({ REX_SESSION: sessionId, REX_BLOCK: blockId })).toEqual(here);
-  expect(rexHereFromEnv({})).toEqual({ sessionId: null, blockId: null });
 });
