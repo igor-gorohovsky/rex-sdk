@@ -1,22 +1,19 @@
 /**
- * Entry point of the rex Claude Code plugin: serves the Rex tools over stdio (see rex-mcp-server.ts).
+ * Entry point of the rex Claude Code plugin: serves the Rex tools to one Claude Code session over
+ * stdio (see rex-mcp-server.ts). http.ts serves every session on the machine from one process.
  */
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { Layer, Logger } from "effect";
-import { rexSdkLayerFromOptions } from "../src/index.ts";
 import { rexHereFromEnv } from "../pi/index.ts";
 import { rexToolOperations } from "../pi/rex-tool-operations.ts";
-import { RexToolRuntime } from "../pi/rex-tool-runtime.ts";
-import { REX_MCP_SERVER_VERSION, RexMcpServer } from "./rex-mcp-server.ts";
+import { makeRexMcpRuntime, RexMcpServer } from "./rex-mcp-server.ts";
 
-// stdout carries the MCP messages, so Effect's built-in loggers write to stderr.
-const runtime = new RexToolRuntime(() =>
-  rexSdkLayerFromOptions({
-    client: { kind: "agent", name: "cc-rex-mcp", version: REX_MCP_SERVER_VERSION },
-  }).pipe(Layer.provideMerge(Layer.succeed(Logger.LogToStderr, true))),
-);
+const runtime = makeRexMcpRuntime();
 const transport = new StdioServerTransport();
-await new RexMcpServer(runtime, rexToolOperations, rexHereFromEnv(process.env)).connect(transport);
+const server = await new RexMcpServer(runtime, rexToolOperations).connect(
+  transport,
+  rexHereFromEnv(process.env),
+);
+server.onclose = () => void runtime.dispose();
 // The stdio transport ignores the end of stdin. Close it then, so the runtime's Rex connection is
 // disposed and the process exits instead of outliving Claude Code.
 process.stdin.once("end", () => void transport.close());

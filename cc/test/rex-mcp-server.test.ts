@@ -51,17 +51,17 @@ describe("rex MCP server", () => {
       }),
     );
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-    await new RexMcpServer(runtime, rexToolOperations, { sessionId, blockId }).connect(
-      serverTransport,
-    );
+    await new RexMcpServer(runtime, rexToolOperations).connect(serverTransport, {
+      sessionId,
+      blockId,
+    });
     client = new Client({ name: "rex-mcp-test", version: "0.0.0" });
     await client.connect(clientTransport);
   });
 
   afterAll(async () => {
-    // Disposed and awaited here: the dispose that closing the client starts is not awaited.
-    await runtime.dispose();
     await client.close();
+    await runtime.dispose();
     await Effect.runPromise(Scope.close(scope, Exit.void));
   });
 

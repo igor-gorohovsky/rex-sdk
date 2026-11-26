@@ -204,7 +204,8 @@ const rexSearchOutput = {
   ],
 };
 
-function readSearchInput(params: unknown): RexSearchInput {
+/** The search input in `rex_search` arguments; a field of the wrong type is left out. */
+export function readSearchInput(params: unknown): RexSearchInput {
   if (typeof params !== "object" || params === null) return {};
   const read = (key: string) => Object.getOwnPropertyDescriptor(params, key)?.value;
   const query = read("query");
