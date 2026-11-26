@@ -1,5 +1,5 @@
 ---
-name: rex-tools
+name: rex
 description: Drive Rex (sessions, tabs, panes, terminals) through the rex MCP tools, not the rex CLI. Find a tool, learn where the agent runs with here, run a command in a terminal and wait for its output, and read results and errors.
 ---
 

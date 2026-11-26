@@ -24,16 +24,32 @@ export class RexToolRuntime {
     context: RexToolContext,
     signal: AbortSignal | undefined,
   ): Promise<CallToolResult> {
-    this.#runtime ??= ManagedRuntime.make(this.#makeLayer());
-    const exit = await this.#runtime.runPromiseExit(
-      runTool(tool, params, context),
-      signal === undefined ? undefined : { signal },
-    );
+    const exit = await this.run(runTool(tool, params, context), signal);
     if (Exit.isSuccess(exit)) return convertToTextResult(exit.value);
     const failure = describeFailure(exit.cause);
-    // A configuration failure is cached by the runtime's Layer; rebuild it on the next call.
-    if (failure.tag === "RexConfigurationError") await this.dispose();
     return convertToErrorResult(`${failure.tag}: ${failure.message}`);
+  }
+
+  /** Runs `program` on the SDK runtime, building it first if needed; a failure may be the runtime's. */
+  async run<A, E>(
+    program: Effect.Effect<A, E, RexSdk>,
+    signal?: AbortSignal,
+  ): Promise<Exit.Exit<A, unknown>> {
+    const runtime = (this.#runtime ??= ManagedRuntime.make(this.#makeLayer()));
+    const exit = await runtime.runPromiseExit(
+      program,
+      signal === undefined ? undefined : { signal },
+    );
+    // A configuration failure is cached by the runtime's Layer; rebuild it on the next run. Only
+    // the runtime that failed: a concurrent run may already have built its replacement.
+    if (
+      Exit.isFailure(exit) &&
+      describeFailure(exit.cause).tag === "RexConfigurationError" &&
+      this.#runtime === runtime
+    ) {
+      await this.dispose();
+    }
+    return exit;
   }
 
   async dispose(): Promise<void> {

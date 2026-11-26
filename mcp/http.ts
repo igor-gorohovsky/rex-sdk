@@ -8,7 +8,7 @@
  */
 import { parseArgs } from "node:util";
 import { REX_MCP_HTTP_DEFAULT_PORT, startRexMcpHttpServer } from "./rex-mcp-http.ts";
-import { loadRexMcpDocs, makeRexMcpRuntime, RexMcpServer } from "./rex-mcp-server.ts";
+import { loadRexMcpSkills, makeRexMcpRuntime, RexMcpServer } from "./rex-mcp-server.ts";
 import { rexTools } from "./rex-tools.ts";
 
 const { values } = parseArgs({ options: { port: { type: "string" } } });
@@ -17,10 +17,10 @@ const port = Number(portText);
 if (!/^\d+$/.test(portText) || port > 65_535) {
   throw new Error(`--port ${portText} is not a port number`);
 }
-const docs = await loadRexMcpDocs();
+const skills = await loadRexMcpSkills();
 const runtime = makeRexMcpRuntime();
 const service = await startRexMcpHttpServer({
-  mcp: new RexMcpServer(runtime, rexTools, docs),
+  mcp: new RexMcpServer(runtime, rexTools, skills),
   port,
 });
 console.error(`rex-mcp: serving ${service.url}`);

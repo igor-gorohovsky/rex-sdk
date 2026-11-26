@@ -1,24 +1,25 @@
 /**
  * Serves the Rex tools to one client over stdio, such as the Claude Code plugin in .mcp.json.
- * The client runs in the block REX_BLOCK names. http.ts serves every agent on the machine from one
+ * The client runs in the block REX_BLOCK names; outside Rex it gets an empty server unless
+ * REX_MCP_HEADLESS is set. http.ts serves every agent on the machine from one
  * process instead.
  */
 import { serveStdio, StdioServerTransport } from "@modelcontextprotocol/server/stdio";
 import {
-  loadRexMcpDocs,
+  loadRexMcpSkills,
   makeRexMcpRuntime,
-  parseCallerBlockId,
+  parseRexMcpCallerClaim,
   REX_MCP_MAX_MESSAGE_BYTES,
   RexMcpServer,
 } from "./rex-mcp-server.ts";
 import { rexTools } from "./rex-tools.ts";
 
-const callerBlockId = parseCallerBlockId(process.env.REX_BLOCK);
+const claim = parseRexMcpCallerClaim(process.env.REX_BLOCK, process.env.REX_MCP_HEADLESS);
 const runtime = makeRexMcpRuntime();
-const mcp = new RexMcpServer(runtime, rexTools, await loadRexMcpDocs());
+const mcp = new RexMcpServer(runtime, rexTools, await loadRexMcpSkills());
 serveStdio(
-  () => {
-    const instance = mcp.createServer(callerBlockId);
+  async () => {
+    const instance = await mcp.createServer(claim);
     // However the connection ends (stdin closed, or a message the transport could not read),
     // dispose the Rex connection so the process exits instead of outliving its client. The
     // runtime is rebuilt if a later instance still calls a tool.

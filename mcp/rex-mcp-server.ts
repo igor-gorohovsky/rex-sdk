@@ -1,7 +1,7 @@
 /**
  * The Rex tools as an MCP server, for every MCP client (Claude Code, pi, …): one tool per row of
- * the tool table in rex-tools.ts, and the usage docs as one skill, skills/rex-tools/SKILL.md, served
- * as an MCP skill and as the server instructions (README.md, "The docs").
+ * the tool table in rex-tools.ts, and the usage docs as one skill, skills/rex/SKILL.md, served
+ * as an MCP skill and a resource that the server instructions point to (README.md, "The docs").
  *
  * Results are JSON text only. Claude Code's code mode hands a script the parsed value of JSON text,
  * but a string once a result carries `structuredContent` (v2.1.332), and MCP allows an
@@ -9,7 +9,8 @@
  * TypeScript type instead.
  *
  * A server instance holds no state of its own: the transport builds one per HTTP request or stdio
- * connection with the client's block (`callerBlockId`), and the marks live in the process-wide store.
+ * connection for the client's caller claim, and the marks live in the process-wide store. A client
+ * outside Rex that does not opt in is offered nothing.
  */
 import { fileURLToPath } from "node:url";
 import {
@@ -24,8 +25,8 @@ import {
   type SkillFiles,
 } from "@modelcontextprotocol/server/ext/skills";
 import { nodeSkillFiles } from "@modelcontextprotocol/server/ext/skills/node";
-import { Layer, Logger, Schema } from "effect";
-import { BlockId, rexSdkLayerFromOptions } from "../src/index.ts";
+import { Duration, Effect, Exit, Layer, Logger, Schema } from "effect";
+import { BlockId, RexSdk, rexSdkLayerFromOptions, type SessionId } from "../src/index.ts";
 import plugin from "./.claude-plugin/plugin.json" with { type: "json" };
 import { RexMarkStore } from "./rex-marks.ts";
 import { describeResultType } from "./rex-result-types.ts";
@@ -34,7 +35,7 @@ import {
   deriveRexToolOutputJsonSchema,
   deriveRexToolParametersJsonSchema,
 } from "./rex-tool-schemas.ts";
-import type { RexTool } from "./rex-tools.ts";
+import { findBlockSession, type RexTool } from "./rex-tools.ts";
 
 /** The version in `.claude-plugin/plugin.json`, sent as the MCP server and Rex client version. */
 const REX_MCP_SERVER_VERSION = plugin.version;
@@ -42,31 +43,11 @@ const REX_MCP_SERVER_VERSION = plugin.version;
 /** The folder of skill folders the server serves. */
 const REX_SKILLS_ROOT = fileURLToPath(new URL("./skills", import.meta.url));
 
-/**
- * The skill that holds the usage docs. Not `rex`: that is Rex's own skill for its CLI
- * (`rex skill show`, ~/.agents/skills/rex).
- */
-const REX_SKILL_NAME = "rex-tools";
+/** Where a client finds the usage docs, the rex skill, as a skill or a plain resource. */
+export const REX_SKILL_URI = "skill://rex/SKILL.md";
 
-/** Where a client finds the usage docs, as a skill or a plain resource. */
-export const REX_SKILL_URI = `skill://${REX_SKILL_NAME}/SKILL.md`;
-
-/** The usage docs, served two ways from one SKILL.md. */
-export interface RexMcpDocs {
-  /** The skills extension's catalog: `skills/list`, `skills/get`, and `skill://` resources. */
-  readonly skills: SkillCatalog;
-  /** The server instructions. */
-  readonly instructions: string;
-}
-
-/**
- * The server instructions: a pointer to the skill, then the SKILL.md body. The pointer comes first
- * because pi puts only the first line in its system prompt.
- */
-function buildRexMcpInstructions(skillMarkdown: string): string {
-  const body = skillMarkdown.replace(/^---\r?\n[\s\S]*?\r?\n---(?:\r?\n)+/, "");
-  return `Rex tools for sessions, tabs, panes, terminals. The rest of these instructions is the rex-tools skill (${REX_SKILL_URI}): read it before the first call (pi: describeNamespace("mcp__rex")).\n\n${body}`;
-}
+/** The pointer to the skill in the server instructions: the docs cost context only when read. */
+const REX_MCP_SKILL_POINTER = `Rex MCP server: tools that drive Rex sessions, tabs, panes, and terminals. Required before your first Rex tool call: read the usage guide, the MCP resource ${REX_SKILL_URI} on this server (Claude Code: ReadMcpResourceTool; pi: read_mcp_resource), which gives the result shape, the error tags, and how to run a command and wait for its output; the tool list alone does not.`;
 
 /**
  * `files`, answering every read of a path with the bytes of its first read. The catalog reads each
@@ -86,15 +67,11 @@ function cacheSkillFileReads(files: SkillFiles): SkillFiles {
 }
 
 /**
- * Loads the skills under `skillsRoot` once: the skill and the instructions keep the text they
- * started with until a restart. A SKILL.md the extension would warn about fails the start instead.
+ * Loads the skills under `skillsRoot` once: they keep the text they started with until a restart.
+ * A SKILL.md the extension would warn about fails the start instead.
  */
-export async function loadRexMcpDocs(skillsRoot: string = REX_SKILLS_ROOT): Promise<RexMcpDocs> {
-  const files = cacheSkillFileReads(nodeSkillFiles(skillsRoot));
-  const skills = await SkillsExtension.load(files, { strict: true });
-  // From the cache the catalog filled, so the instructions are the text the skill serves.
-  const skillMarkdown = new TextDecoder().decode(await files.read(`${REX_SKILL_NAME}/SKILL.md`));
-  return { skills, instructions: buildRexMcpInstructions(skillMarkdown) };
+export function loadRexMcpSkills(skillsRoot: string = REX_SKILLS_ROOT): Promise<SkillCatalog> {
+  return SkillsExtension.load(cacheSkillFileReads(nodeSkillFiles(skillsRoot)), { strict: true });
 }
 
 /**
@@ -128,11 +105,43 @@ interface RexMcpTool {
 const isBlockId = Schema.is(BlockId);
 
 /**
- * The caller's block from what its client reports (the `X-Rex-Block` header or `REX_BLOCK`):
- * null when that is not one block ID, such as empty for an unset variable.
+ * What a client reports about where it runs: its block (the `X-Rex-Block` header or `REX_BLOCK`),
+ * null when that is not one block ID (empty for an unset variable, `none`), and whether it opts in
+ * from outside Rex (the `X-Rex-Headless` header or `REX_MCP_HEADLESS`, any non-empty value), as an
+ * agent a timer starts does.
  */
-export function parseCallerBlockId(value: string | null | undefined): BlockId | null {
-  return isBlockId(value) ? value : null;
+export interface RexMcpCallerClaim {
+  readonly blockId: BlockId | null;
+  readonly headless: boolean;
+}
+
+export function parseRexMcpCallerClaim(
+  block: string | null | undefined,
+  headless: string | null | undefined,
+): RexMcpCallerClaim {
+  return { blockId: isBlockId(block) ? block : null, headless: Boolean(headless) };
+}
+
+/**
+ * Who the server serves, once Rex has checked the claim: a block Rex knows (`sessionId` null when
+ * Rex did not answer), an agent outside Rex that opted in, or anyone else, who is offered nothing.
+ */
+type RexMcpCaller =
+  | { readonly _tag: "InRex"; readonly blockId: BlockId; readonly sessionId: SessionId | null }
+  | { readonly _tag: "Headless" }
+  | { readonly _tag: "Outside" };
+
+/** How long the server waits for Rex to say where a caller's block is. */
+const LOCATE_TIMEOUT = Duration.seconds(3);
+
+/** The server instructions, one line, as pi puts only the first line in its system prompt. */
+function describeRexMcpInstructions(caller: Exclude<RexMcpCaller, { _tag: "Outside" }>): string {
+  if (caller._tag === "Headless") return REX_MCP_SKILL_POINTER;
+  const where =
+    caller.sessionId === null
+      ? `You run in Rex block ${caller.blockId}; Rex did not say its session (the here tool asks again).`
+      : `You run in Rex session ${caller.sessionId}, block ${caller.blockId} (the here tool answers fresh).`;
+  return `${where} ${REX_MCP_SKILL_POINTER}`;
 }
 
 function convertToListedTool(tool: RexTool): Tool {
@@ -158,16 +167,16 @@ export class RexMcpServer {
   readonly #tools: ReadonlyMap<string, RexMcpTool>;
   readonly #listed: readonly Tool[];
   readonly #progressIntervalMs: number;
-  readonly #docs: RexMcpDocs;
+  readonly #skills: SkillCatalog;
 
   constructor(
     runtime: RexToolRuntime,
     tools: readonly RexTool[],
-    docs: RexMcpDocs,
+    skills: SkillCatalog,
     options: { readonly progressIntervalMs?: number } = {},
   ) {
     this.#runtime = runtime;
-    this.#docs = docs;
+    this.#skills = skills;
     this.#progressIntervalMs = options.progressIntervalMs ?? PROGRESS_INTERVAL_MS;
     const entries = tools.map((tool) => ({ tool, listed: convertToListedTool(tool) }));
     this.#listed = entries.map(({ listed }) => listed);
@@ -184,18 +193,25 @@ export class RexMcpServer {
     return [...this.#listed];
   }
 
-  /** An MCP server instance for one request or connection of a client in `callerBlockId`. */
-  createServer(callerBlockId: BlockId | null): McpServer {
+  /**
+   * An MCP server instance for one request or connection of a client that claims `claim`: with
+   * nothing in it (no tools, skills, or instructions) for a caller outside Rex that did not opt in.
+   */
+  async createServer(claim: RexMcpCallerClaim): Promise<McpServer> {
+    const caller = await this.#locateCaller(claim);
+    if (caller._tag === "Outside")
+      return new McpServer({ name: "rex", version: REX_MCP_SERVER_VERSION });
+    const callerBlockId = caller._tag === "InRex" ? caller.blockId : null;
     // McpServer because the skills extension attaches only to one; the tools are answered from the
     // precomputed table on its low-level server, not registered one by one. The tools capability
     // goes there too: McpServer's `tools` option would install its own tool handlers and advertise
     // `listChanged`, which this server never sends.
     const mcpServer = new McpServer(
       { name: "rex", version: REX_MCP_SERVER_VERSION },
-      { instructions: this.#docs.instructions },
+      { instructions: describeRexMcpInstructions(caller) },
     );
     mcpServer.server.registerCapabilities({ tools: {} });
-    this.#docs.skills.attach(mcpServer);
+    this.#skills.attach(mcpServer);
     mcpServer.server.setRequestHandler("tools/list", async () => ({ tools: this.listTools() }));
     mcpServer.server.setRequestHandler("tools/call", async (request, context) => {
       const progressToken = context.mcpReq._meta?.progressToken;
@@ -245,5 +261,23 @@ export class RexMcpServer {
       );
     }
     return this.#runtime.call(entry.tool, params, { callerBlockId, marks: this.#marks }, signal);
+  }
+
+  /**
+   * The caller its claim describes, asking Rex for the claimed block: a block Rex does not have
+   * counts as no block. When Rex does not answer, the caller keeps its block, with no session.
+   */
+  async #locateCaller({ blockId, headless }: RexMcpCallerClaim): Promise<RexMcpCaller> {
+    if (blockId !== null) {
+      const located = await this.#runtime.run(
+        Effect.gen(function* () {
+          const rex = yield* RexSdk;
+          return yield* findBlockSession(rex, blockId, { timeout: LOCATE_TIMEOUT });
+        }),
+      );
+      if (Exit.isFailure(located)) return { _tag: "InRex", blockId, sessionId: null };
+      if (located.value !== null) return { _tag: "InRex", blockId, sessionId: located.value };
+    }
+    return headless ? { _tag: "Headless" } : { _tag: "Outside" };
   }
 }

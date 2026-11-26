@@ -374,6 +374,17 @@ const optionalLayoutField = Schema.optionalKey(RexLayoutNode).annotateKey({
   description: layoutDescription,
 });
 
+/** The session Rex has `blockId` in: null when Rex does not have the block. */
+export function findBlockSession(rex: IRexSdk, blockId: BlockId, options: RexRequestOptions) {
+  return Effect.map(
+    rex.targets.resolve({ kinds: ["block"], queries: [blockId] }, options),
+    ({ results }) =>
+      Option.getOrNull(
+        Option.flatMap(results[0]?.target ?? Option.none(), (target) => target.sessionId),
+      ),
+  );
+}
+
 const Here = Schema.Struct({
   sessionId: Schema.NullOr(SessionId),
   blockId: Schema.NullOr(BlockId),
@@ -391,15 +402,10 @@ export const rexTools: readonly RexTool[] = [
     run: (rex, _fields, options, { callerBlockId }) =>
       callerBlockId === null
         ? Effect.succeed({ sessionId: null, blockId: null })
-        : Effect.map(
-            rex.targets.resolve({ kinds: ["block"], queries: [callerBlockId] }, options),
-            ({ results }) => ({
-              sessionId: Option.getOrNull(
-                Option.flatMap(results[0]?.target ?? Option.none(), (target) => target.sessionId),
-              ),
-              blockId: callerBlockId,
-            }),
-          ),
+        : Effect.map(findBlockSession(rex, callerBlockId, options), (sessionId) => ({
+            sessionId,
+            blockId: callerBlockId,
+          })),
   }),
   method({
     name: "sessions_view",

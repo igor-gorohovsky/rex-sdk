@@ -138,7 +138,7 @@ client. One process can serve every agent on a machine:
 ```sh
 node mcp/http.ts --port 7317
 claude mcp add -s user --transport http rex http://127.0.0.1:7317/mcp -H 'X-Rex-Block: ${REX_BLOCK:-}'
-pi mcp add rex --url http://127.0.0.1:7317/mcp --header 'X-Rex-Block=${REX_BLOCK}'
+pi mcp add rex --url http://127.0.0.1:7317/mcp --header 'X-Rex-Block=!printf %s "${REX_BLOCK:-none}"'
 ```
 
 ## Development

@@ -2,27 +2,26 @@
 
 Serves this SDK to agents as an MCP server: one tool per SDK operation, plus `here`, for Claude
 Code, pi, and any other MCP client. The tool table is [`rex-tools.ts`](rex-tools.ts). The usage
-docs are one skill, [`skills/rex-tools/SKILL.md`](skills/rex-tools/SKILL.md); nothing else
+docs are one skill, [`skills/rex/SKILL.md`](skills/rex/SKILL.md); nothing else
 describes the tools.
 
 ## The docs
 
 The server serves the skill through the MCP skills extension (`io.modelcontextprotocol/skills`:
-`skills/list`, `skills/get`, `resources/directory/read`) at `skill://rex-tools/SKILL.md`, which
-is also an ordinary resource. The server instructions are a pointer to that URI followed by the
-SKILL.md body, built at start, so every client has the docs even when it does not load MCP skills:
+`skills/list`, `skills/get`, `resources/directory/read`) at `skill://rex/SKILL.md`, which
+is also an ordinary resource. The server instructions are one line that points to that resource,
+so the docs cost context only when an agent reads them:
 
-| Client                                                             | How the docs reach the model                                                                              |
-| ------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------- |
-| Claude Code, MCP skills blocked (Team plan default) or `claude -p` | The server instructions; the skill as a resource (ReadMcpResourceTool)                                    |
-| Claude Code, MCP skills allowed                                    | The instructions, and `rex-tools` as a skill                                                              |
-| pi (no MCP skills)                                                 | The first line in the system prompt; the rest with `describeNamespace("mcp__rex")` or `read_mcp_resource` |
-| Claude Code with this folder as a plugin (`--plugin-dir`)          | Also `rex:rex-tools` as a plugin skill: Claude Code loads a plugin's `skills/` folder itself              |
+| Client                                                             | How the docs reach the model                                                           |
+| ------------------------------------------------------------------ | -------------------------------------------------------------------------------------- |
+| Claude Code, MCP skills blocked (Team plan default) or `claude -p` | The pointer in the instructions; the agent reads the resource (ReadMcpResourceTool)    |
+| Claude Code, MCP skills allowed                                    | The pointer, and `rex` as a skill                                                      |
+| pi (no MCP skills)                                                 | The pointer in the system prompt; the agent reads the resource (`read_mcp_resource`)   |
+| Claude Code with this folder as a plugin (`--plugin-dir`)          | Also `rex:rex` as a plugin skill: Claude Code loads a plugin's `skills/` folder itself |
 
-Claude Code (2.1.332) cuts server instructions after 4096 characters, so the SKILL.md body must
-fit (a test checks it); longer guidance belongs in files under `skills/rex-tools/references/`.
-The skill is not named `rex`, the name of Rex's own skill for its CLI. The server reads the skill
-once, at start, and serves that text until it restarts, however the checkout changes.
+Keep SKILL.md short; longer guidance belongs in files under `skills/rex/references/`, which the
+extension serves too. The server reads the skill once, at start, and serves that text until it
+restarts, however the checkout changes.
 
 ## Run it
 
@@ -41,6 +40,19 @@ The headers differ because the hosts expand them differently. Claude Code sends
 variable is unset, and sends any other `${…}` as written; it also drops a header whose `!command`
 prints nothing. So pi runs a command that prints `none` outside Rex, which the server reads as
 no block.
+
+Outside Rex the server offers nothing: a request with no block, `none`, or a block Rex does not
+have gets an empty server, with no tools, resources, or instructions, so an agent started outside
+Rex does not carry the tools. An agent outside Rex that needs them, such as a `claude -p` a timer
+starts, opts in with `X-Rex-Headless: 1` (`REX_MCP_HEADLESS=1` over stdio) and gets the tools,
+with no block. Inside Rex the instructions begin with the session and block the agent runs in:
+
+```text
+You run in Rex session session:…, block block:… (the here tool answers fresh). Rex MCP server: …
+```
+
+The server asks Rex where the block is on every request (one `target.resolve`); when Rex does
+not answer, it keeps serving the block, with no session.
 
 A call still running sends a progress notification every 15 seconds when the client asks for
 them, as pi does. Each one resets pi's 60-second request timeout, so a wait runs as long as its
@@ -85,7 +97,7 @@ The skill covers names, parameters, results, failures, and waits. What it leaves
   TypeScript type instead: Claude Code (2.1.332) hands a script a string instead of the parsed
   value once a result has it, and MCP allows an `outputSchema` only with `structuredContent`.
 - **`here`** takes the block from the `X-Rex-Block` header of each request, or `REX_BLOCK` over
-  stdio, and asks Rex (`target.resolve`) for its session.
+  stdio, and asks Rex (`target.resolve`) for its session; null for both for a headless agent.
 - **Marks** live in one store per process: the newest 1024 under random IDs, so a restart forgets
   them (`RexUnknownMark`).
 - **Not exposed**: `rexToolExclusions` in `rex-tools.ts` names each SDK operation left out, and
@@ -102,12 +114,12 @@ The skill covers names, parameters, results, failures, and waits. What it leaves
 | File                  | Owns                                                            |
 | --------------------- | --------------------------------------------------------------- |
 | `rex-tools.ts`        | The tool table and the SDK operations left out                  |
-| `skills/rex-tools/`   | The usage docs: the skill, and the server instructions          |
+| `skills/rex/`         | The usage docs: the skill the server instructions point to      |
 | `rex-tool-schemas.ts` | Effect Schema → JSON Schema for parameters and results          |
 | `rex-result-types.ts` | A result's JSON Schema → the TypeScript type in its description |
 | `rex-tool-runtime.ts` | The lazily built SDK runtime, exits → MCP tool results          |
 | `rex-marks.ts`        | The process-wide mark store                                     |
-| `rex-mcp-server.ts`   | Tool listing and calls, one server instance per request         |
+| `rex-mcp-server.ts`   | Tool listing and calls, the caller check, and the instructions  |
 | `rex-mcp-http.ts`     | HTTP serving, Host and peer checks                              |
 | `http.ts`, `stdio.ts` | Entry points                                                    |
 | `test/`               | Every tool and both protocol eras against the SDK's test server |

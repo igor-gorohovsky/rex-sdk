@@ -17,7 +17,7 @@ import { startRexTestServer, type IRexTestServer } from "../../src/testing/rex-t
 import { startRexTestTerminal } from "../../src/testing/rex-test-terminal.ts";
 import { findTcpPeerUid, startRexMcpHttpServer, type RexMcpHttpServer } from "../rex-mcp-http.ts";
 import {
-  loadRexMcpDocs,
+  loadRexMcpSkills,
   makeRexMcpRuntime,
   REX_SKILL_URI,
   RexMcpServer,
@@ -37,10 +37,7 @@ const ToolResult = Schema.Struct({
   structuredContent: Schema.optionalKey(Schema.Unknown),
 });
 const decodeToolResult = Schema.decodeUnknownSync(ToolResult);
-const skillMarkdown = readFileSync(
-  new URL("../skills/rex-tools/SKILL.md", import.meta.url),
-  "utf8",
-);
+const skillMarkdown = readFileSync(new URL("../skills/rex/SKILL.md", import.meta.url), "utf8");
 
 /** Sends one raw HTTP request, so a test can set headers fetch refuses, such as Host. */
 function sendRaw(url: string, headers: Record<string, string>, body: string) {
@@ -59,6 +56,9 @@ function sendRaw(url: string, headers: Record<string, string>, body: string) {
     outgoing.end(body);
   });
 }
+
+/** The header an agent outside Rex sends to get the tools, as the dream does. */
+const headless = { "X-Rex-Headless": "1" };
 
 /** The two protocol eras the service serves: pi speaks 2025-11-25, Claude Code 2026-07-28. */
 const eras = [
@@ -129,7 +129,9 @@ describe("rex MCP over HTTP", () => {
       }),
     );
     service = await startRexMcpHttpServer({
-      mcp: new RexMcpServer(runtime, rexTools, await loadRexMcpDocs(), { progressIntervalMs: 100 }),
+      mcp: new RexMcpServer(runtime, rexTools, await loadRexMcpSkills(), {
+        progressIntervalMs: 100,
+      }),
       port: 0,
       log: () => undefined,
     });
@@ -144,28 +146,24 @@ describe("rex MCP over HTTP", () => {
 
   for (const { era, versionNegotiation } of eras) {
     describe(era, () => {
-      test("the instructions point to the skill, then carry its SKILL.md body whole", async () => {
-        const client = await connectClient({}, versionNegotiation);
+      test("the instructions are one line pointing to a resource that holds the skill", async () => {
+        const client = await connectClient(headless, versionNegotiation);
         const instructions = client.getInstructions() ?? "";
-        expect(instructions.split("\n")[0]).toContain(REX_SKILL_URI);
-        // The whole body after the frontmatter, as SKILL.md has it.
-        const body = skillMarkdown.slice(skillMarkdown.indexOf("\n# Rex tools\n") + 1);
-        expect(body.startsWith("# Rex tools\n")).toBe(true);
-        expect(instructions.endsWith(`\n\n${body}`)).toBe(true);
-        expect(instructions).not.toContain("name: rex-tools");
-        // Claude Code (2.1.332) cuts instructions after 4096 characters, which would drop the end of
-        // the docs: past that, move guidance into files under the skill's references/.
-        expect(instructions.length).toBeLessThanOrEqual(4096);
-        expect(instructions).not.toMatch(/\brex_(?!_)/);
+        // pi puts only the first line in its system prompt.
+        expect(instructions).not.toContain("\n");
+        const uri = /skill:\/\/\S+\.md/.exec(instructions)?.[0];
+        expect(uri).toBe(REX_SKILL_URI);
+        const read = await client.readResource({ uri: uri ?? "" });
+        expect(read.contents[0]).toMatchObject({ text: skillMarkdown });
       });
 
-      test("serves the rex-tools skill through the skills extension and as a plain resource", async () => {
-        const client = await connectClient({}, versionNegotiation);
+      test("serves the rex skill through the skills extension and as a plain resource", async () => {
+        const client = await connectClient(headless, versionNegotiation);
         const skills = new SkillsClient(client);
         expect(skills.supported).toBe(true);
         const { skills: listed } = await skills.list();
         expect(listed.map((skill) => [skill.uri, skill.frontmatter.name])).toEqual([
-          [REX_SKILL_URI, "rex-tools"],
+          [REX_SKILL_URI, "rex"],
         ]);
         const { skill } = await skills.get(REX_SKILL_URI);
         // read checks the file against the digest and size in the entry.
@@ -180,7 +178,7 @@ describe("rex MCP over HTTP", () => {
       });
 
       test("lists every tool with an object input schema, no output schema, and its result type", async () => {
-        const client = await connectClient({}, versionNegotiation);
+        const client = await connectClient(headless, versionNegotiation);
         // The tool list never changes, so the server does not offer list_changed notifications.
         expect(client.getServerCapabilities()?.tools).toEqual({});
         const { tools } = await client.listTools();
@@ -197,17 +195,51 @@ describe("rex MCP over HTTP", () => {
 
       test("here is the block in each request's X-Rex-Block header, and the session Rex has it in", async () => {
         const inside = await connectClient({ "X-Rex-Block": blockId }, versionNegotiation);
-        const closed = await connectClient({ "X-Rex-Block": closedBlockId }, versionNegotiation);
-        const outside = await connectClient({ "X-Rex-Block": "" }, versionNegotiation);
+        const outside = await connectClient(headless, versionNegotiation);
         const readHere = async (client: Client) =>
           decodeJsonText((await callTool(client, "here", {})).content[0].text);
         expect(await readHere(inside)).toEqual({ sessionId, blockId });
-        expect(await readHere(closed)).toEqual({ sessionId: null, blockId: closedBlockId });
         expect(await readHere(outside)).toEqual({ sessionId: null, blockId: null });
       });
 
+      test("a block Rex knows gets the tools, and its session and block in one line of instructions", async () => {
+        const client = await connectClient({ "X-Rex-Block": blockId }, versionNegotiation);
+        const instructions = client.getInstructions() ?? "";
+        expect(instructions).not.toContain("\n");
+        expect(instructions).toContain(`Rex session ${sessionId}, block ${blockId}`);
+        expect(instructions).toContain(REX_SKILL_URI);
+        expect((await client.listTools()).tools.length).toBe(rexTools.length);
+      });
+
+      test("a caller outside Rex that does not opt in is offered nothing", async () => {
+        for (const headers of [
+          {},
+          { "X-Rex-Block": "" },
+          { "X-Rex-Block": "none" },
+          { "X-Rex-Block": closedBlockId },
+          { "X-Rex-Block": closedBlockId, "X-Rex-Headless": "" },
+        ]) {
+          const client = await connectClient(headers, versionNegotiation);
+          expect(client.getInstructions()).toBeUndefined();
+          const capabilities = client.getServerCapabilities() ?? {};
+          expect(capabilities.tools).toBeUndefined();
+          expect(capabilities.resources).toBeUndefined();
+          expect((await client.listTools()).tools).toEqual([]);
+        }
+      });
+
+      test("an unknown block that opts in is served as headless", async () => {
+        const client = await connectClient(
+          { "X-Rex-Block": closedBlockId, ...headless },
+          versionNegotiation,
+        );
+        expect(client.getInstructions()).not.toContain("You run in Rex");
+        const here = decodeJsonText((await callTool(client, "here", {})).content[0].text);
+        expect(here).toEqual({ sessionId: null, blockId: null });
+      });
+
       test("a result is JSON text only; a failure is an error result led by the error tag", async () => {
-        const client = await connectClient({}, versionNegotiation);
+        const client = await connectClient(headless, versionNegotiation);
         const list = await callTool(client, "sessions_list", {});
         expect(list.isError).toBeUndefined();
         expect(list.structuredContent).toBeUndefined();
@@ -228,7 +260,7 @@ describe("rex MCP over HTTP", () => {
       });
 
       test("a call that outlasts the client's request timeout keeps it alive with progress", async () => {
-        const client = await connectClient({}, versionNegotiation);
+        const client = await connectClient(headless, versionNegotiation);
         const progress: number[] = [];
         const wait = await client.callTool(
           {
@@ -251,7 +283,7 @@ describe("rex MCP over HTTP", () => {
       });
 
       test("a mark made in one request serves a wait in the next", async () => {
-        const client = await connectClient({}, versionNegotiation);
+        const client = await connectClient(headless, versionNegotiation);
         const target = { sessionId, blockId };
         const mark = decodeJsonText(
           (await callTool(client, "terminals_mark", target)).content[0].text,
@@ -335,10 +367,13 @@ test("the skill keeps the text the server started with after SKILL.md changes on
   const runtime = makeRexMcpRuntime();
   try {
     cpSync(fileURLToPath(new URL("../skills", import.meta.url)), root, { recursive: true });
-    const docs = await loadRexMcpDocs(root);
-    writeFileSync(join(root, "rex-tools", "SKILL.md"), `${skillMarkdown}\nChanged.\n`);
+    const skills = await loadRexMcpSkills(root);
+    writeFileSync(join(root, "rex", "SKILL.md"), `${skillMarkdown}\nChanged.\n`);
     const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-    const instance = new RexMcpServer(runtime, rexTools, docs).createServer(null);
+    const instance = await new RexMcpServer(runtime, rexTools, skills).createServer({
+      blockId: null,
+      headless: true,
+    });
     await instance.connect(serverTransport);
     const client = new Client(
       { name: "rex-mcp-skill-test", version: "0.0.0" },
@@ -348,7 +383,6 @@ test("the skill keeps the text the server started with after SKILL.md changes on
     try {
       const read = await client.readResource({ uri: REX_SKILL_URI });
       expect(read.contents[0]).toMatchObject({ text: skillMarkdown });
-      expect(client.getInstructions()?.endsWith(skillMarkdown.slice(-200))).toBe(true);
     } finally {
       await client.close();
     }

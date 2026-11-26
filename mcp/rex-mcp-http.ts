@@ -10,7 +10,8 @@
  * dual-stack client's socket is listed there): the Rex socket is private to that user, and
  * this server must not open it to every local account. A client says where it runs with the
  * `X-Rex-Block` header on every request, which the client fills from its environment:
- * `"X-Rex-Block": "${REX_BLOCK:-}"`.
+ * `"X-Rex-Block": "${REX_BLOCK:-}"`. A client outside Rex gets an empty server unless it sends
+ * `X-Rex-Headless` (any non-empty value), as the dream's headless `claude -p` does.
  */
 import { readFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
@@ -23,7 +24,7 @@ import {
 import { createMcpHandler } from "@modelcontextprotocol/server";
 import { Option } from "effect";
 import {
-  parseCallerBlockId,
+  parseRexMcpCallerClaim,
   REX_MCP_MAX_MESSAGE_BYTES,
   type RexMcpServer,
 } from "./rex-mcp-server.ts";
@@ -89,7 +90,12 @@ export async function startRexMcpHttpServer(options: RexMcpHttpOptions): Promise
   const onerror = (error: Error) => log(`rex-mcp: ${error.message}`);
   const handler = createMcpHandler(
     ({ requestInfo }) =>
-      mcp.createServer(parseCallerBlockId(requestInfo?.headers.get("x-rex-block"))),
+      mcp.createServer(
+        parseRexMcpCallerClaim(
+          requestInfo?.headers.get("x-rex-block"),
+          requestInfo?.headers.get("x-rex-headless"),
+        ),
+      ),
     {
       onerror,
       maxRequestBodySize: REX_MCP_MAX_MESSAGE_BYTES,
