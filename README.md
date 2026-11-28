@@ -33,7 +33,7 @@ See [examples/project-workspace.ts](examples/project-workspace.ts) for a fuller 
 
 - Rex API revision **18** only. The SDK checks the revision in the handshake and fails with
   `RexUnsupportedApiRevision` on any other.
-- Verified against Rex `0.1.0-preview.21`.
+- Verified against Rex `0.1.0-preview.21`, and in daily use with `0.1.0-preview.25`.
 - Node.js 22.18 or newer; `effect` 4.1.
 
 ## Rex terms

@@ -2,7 +2,7 @@
 
 `rex-sdk` is an Effect-native TypeScript SDK for the Rex server's control API. It targets **Rex
 API revision 18** only (`rex.control.v1`, `rex.data.terminal.v1`), verified against Rex
-`0.1.0-preview.21`. It follows the shape of `../herdr-sdk`: a yieldable aggregate of
+`0.1.0-preview.21`, and in daily use with `0.1.0-preview.25`. It follows the shape of `../herdr-sdk`: a yieldable aggregate of
 namespace services over shared, scoped infrastructure.
 
 ## Sources of truth
