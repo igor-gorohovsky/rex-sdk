@@ -71,12 +71,12 @@ API revision 18** only.
 | `vp run generate` / `vp run check:generated` | Regenerate codecs / check for drift                                  |
 | `vp run fetch:rex-api`                       | Refresh server snapshots when moving to a new Rex release            |
 
-## Remote VM
+## Machine size
 
-For the global rule "Heavy work runs on an exe.dev VM": `vp run ready`, tests and oxlint run on a VM, never on esh-orchestrator.
+`vp run ready`, the tests and oxlint need at least 4 CPUs, 8 GB of RAM and 14 GB of disk.
 
-- Size: `--cpu=4 --memory=8GB --disk=14GB`. At 2 CPU / 4 GB oxlint panics in its allocator. Measured 2026-11-26 at 4/8: `vp run ready` peaks at 0.6 GiB.
-- `src/rex-live.test.ts` needs a real Rex server and skips itself on a VM.
+- At 2 CPUs / 4 GB oxlint panics in its allocator. At 4 CPUs / 8 GB `vp run ready` peaks at 0.6 GiB (measured 2026-11-26).
+- `src/rex-live.test.ts` needs a real Rex server and skips itself where none runs.
 
 <!--VITE PLUS START-->
 
